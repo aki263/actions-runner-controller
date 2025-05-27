@@ -26,6 +26,11 @@ import (
 	"strings"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kubevirtv1 "kubevirt.io/api/core/v1"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil" // For SetControllerReference if not already used for VMIs
+
 	"github.com/actions/actions-runner-controller/build"
 	"github.com/actions/actions-runner-controller/hash"
 	"github.com/go-logr/logr"
@@ -49,6 +54,13 @@ const (
 	finalizerName = "runner.actions.summerwind.dev"
 
 	LabelKeyPodTemplateHash = "pod-template-hash"
+
+	// VMI related labels
+	LabelKeyRunnerCRName      = "actions.summerwind.dev/runner-cr-name"
+	LabelKeyRunnerCRNamespace = "actions.summerwind.dev/runner-cr-namespace"
+	LabelKeyRunnerCRUID       = "actions.summerwind.dev/runner-cr-uid"
+	EnvVarVMINamespace        = "VMI_NAMESPACE"  // To configure the VMI namespace
+	DefaultVMINamespace       = "tenki-68130006" // Default VMI namespace
 
 	retryDelayOnGitHubAPIRateLimitError = 30 * time.Second
 
@@ -290,15 +302,67 @@ func (r *RunnerReconciler) processRunnerDeletion(runner v1alpha1.Runner, ctx con
 
 func (r *RunnerReconciler) processRunnerCreation(ctx context.Context, runner v1alpha1.Runner, log logr.Logger) (reconcile.Result, error) {
 	if updated, err := r.updateRegistrationToken(ctx, runner); err != nil {
-		return ctrl.Result{RequeueAfter: RetryDelayOnCreateRegistrationError}, nil
+		// Log details for registration token update failure
+		log.Error(err, "Failed to update registration token for runner", "runnerName", runner.Name, "runnerNamespace", runner.Namespace)
+		return ctrl.Result{RequeueAfter: RetryDelayOnCreateRegistrationError}, err // Return error to ensure it's captured
 	} else if updated {
+		log.Info("Successfully updated registration token, requeueing", "runnerName", runner.Name, "runnerNamespace", runner.Namespace)
 		return ctrl.Result{Requeue: true}, nil
 	}
 
+	// VMI Check Logic START
+	vmiNamespace := DefaultVMINamespace // Use the constant, consider making this configurable later via RunnerSpec or controller config
+
+	// Construct labels for VMI query
+	vmiLabels := map[string]string{
+		LabelKeyRunnerCRUID: string(runner.UID),
+	}
+
+	listOpts := []client.ListOption{
+		client.InNamespace(vmiNamespace),
+		client.MatchingLabels(vmiLabels),
+	}
+
+	var existingVMIs kubevirtv1.VirtualMachineInstanceList
+	if err := r.List(ctx, &existingVMIs, listOpts...); err != nil {
+		log.Error(err, "Failed to list VirtualMachineInstances for runner", "runnerName", runner.Name, "runnerNamespace", runner.Namespace, "vmiNamespace", vmiNamespace, "labels", vmiLabels)
+		return ctrl.Result{}, fmt.Errorf("failed to list VMIs: %w", err)
+	}
+
+	if len(existingVMIs.Items) > 0 {
+		// A VMI for this runner CR (identified by UID) already exists.
+		existingVMI := existingVMIs.Items[0] // Assuming UID makes it unique
+		log.Info("Found existing VMI for runner CR", "runnerName", runner.Name, "runnerNamespace", runner.Namespace, "vmiName", existingVMI.Name, "vmiNamespace", existingVMI.Namespace, "vmiPhase", existingVMI.Status.Phase)
+
+		switch existingVMI.Status.Phase {
+		case kubevirtv1.Running, kubevirtv1.Scheduled:
+			// VMI is in a healthy state. The pod will be created, and launch-runner.sh will apply ConfigMap and VMI.
+			// This ensures the runner-info is up-to-date.
+			log.Info("Existing VMI is Running/Scheduled. Proceeding with pod creation to ensure runner-info is current.", "vmiName", existingVMI.Name)
+		case kubevirtv1.Pending:
+			log.Info("Existing VMI is Pending. Requeuing to check status again.", "vmiName", existingVMI.Name, "requeueAfter", 15*time.Second)
+			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+		case kubevirtv1.Failed, kubevirtv1.Succeeded:
+			// VMI is in a terminal state (unexpectedly). Try to delete it and create a new one.
+			log.Info("Existing VMI is in a terminal state (Failed/Succeeded). Attempting to delete and recreate.", "vmiName", existingVMI.Name, "vmiPhase", existingVMI.Status.Phase)
+			if err := r.Delete(ctx, &existingVMI); err != nil && !kerrors.IsNotFound(err) {
+				log.Error(err, "Failed to delete existing terminal VMI", "vmiName", existingVMI.Name)
+				return ctrl.Result{}, fmt.Errorf("failed to delete terminal VMI %s: %w", existingVMI.Name, err)
+			}
+			// Continue to pod creation after attempting delete.
+		default:
+			log.Info("Existing VMI is in an unknown or other phase. Requeuing.", "vmiName", existingVMI.Name, "vmiPhase", existingVMI.Status.Phase, "requeueAfter", 30*time.Second)
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+	} else {
+		log.Info("No existing VMI found for runner CR, will proceed to create one via the runner pod.", "runnerName", runner.Name, "runnerNamespace", runner.Namespace, "vmiNamespace", vmiNamespace, "labels", vmiLabels)
+	}
+	// VMI Check Logic END
+
 	newPod, err := r.newPod(runner)
 	if err != nil {
-		log.Error(err, "Could not create pod")
-		return ctrl.Result{}, err
+		log.Error(err, "Could not create pod spec for runner", "runnerName", runner.Name, "runnerNamespace", runner.Namespace)
+		return ctrl.Result{}, err // Return error
 	}
 
 	needsServiceAccount := runner.Spec.ServiceAccountName == "" && (r.RunnerPodDefaults.UseRunnerStatusUpdateHook || runner.Spec.ContainerMode == "kubernetes")
@@ -393,22 +457,19 @@ func (r *RunnerReconciler) processRunnerCreation(ctx context.Context, runner v1a
 
 	if err := r.Create(ctx, &newPod); err != nil {
 		if kerrors.IsAlreadyExists(err) {
-			// Gracefully handle pod-already-exists errors due to informer cache delay.
-			// Without this we got a few errors like the below on new runner pod:
-			// 2021-03-16T00:23:10.116Z        ERROR   controller-runtime.controller   Reconciler error      {"controller": "runner-controller", "request": "default/example-runnerdeploy-b2g2g-j4mcp", "error": "pods \"example-runnerdeploy-b2g2g-j4mcp\" already exists"}
 			log.Info(
 				"Failed to create pod due to AlreadyExists error. Probably this pod has been already created in previous reconcilation but is still not in the informer cache. Will retry on pod created. If it doesn't repeat, there's no problem",
+				"runnerName", runner.Name, "podName", newPod.Name,
 			)
 			return ctrl.Result{}, nil
 		}
 
-		log.Error(err, "Failed to create pod resource")
-
+		log.Error(err, "Failed to create pod resource for runner", "runnerName", runner.Name, "podName", newPod.Name)
 		return ctrl.Result{}, err
 	}
 
 	r.Recorder.Event(&runner, corev1.EventTypeNormal, "PodCreated", fmt.Sprintf("Created pod '%s'", newPod.Name))
-	log.Info("Created runner pod", "repository", runner.Spec.Repository)
+	log.Info("Created runner pod", "repository", runner.Spec.Repository, "runnerName", runner.Name, "podName", newPod.Name)
 
 	return ctrl.Result{}, nil
 }
@@ -716,7 +777,7 @@ func (r *RunnerReconciler) newPod(runner v1alpha1.Runner) (corev1.Pod, error) {
 	return *updated, nil
 }
 
-func mutatePod(pod *corev1.Pod, token string) *corev1.Pod {
+func mutatePod(pod *corev1.Pod, token string, runnerUID string) *corev1.Pod { // Added runnerUID parameter
 	updated := pod.DeepCopy()
 
 	if getRunnerEnv(pod, EnvVarRunnerName) == "" {
@@ -725,6 +786,11 @@ func mutatePod(pod *corev1.Pod, token string) *corev1.Pod {
 
 	if getRunnerEnv(pod, EnvVarRunnerToken) == "" {
 		setRunnerEnv(updated, EnvVarRunnerToken, token)
+	}
+
+	// Inject RUNNER_CR_UID
+	if getRunnerEnv(pod, "RUNNER_CR_UID") == "" {
+		setRunnerEnv(updated, "RUNNER_CR_UID", runnerUID)
 	}
 
 	return updated
@@ -933,6 +999,20 @@ func newRunnerPodWithContainerMode(containerMode string, template corev1.Pod, ru
 	}
 
 	runnerContainer.Env = append(runnerContainer.Env, env...)
+	// Add VMI related env vars
+	runnerContainer.Env = append(runnerContainer.Env, corev1.EnvVar{
+		Name:  "RUNNER_CR_NAME",
+		Value: template.Name, // template.Name is runner.Name
+	})
+	runnerContainer.Env = append(runnerContainer.Env, corev1.EnvVar{
+		Name:  "RUNNER_CR_NAMESPACE",
+		Value: template.Namespace, // template.Namespace is runner.Namespace
+	})
+	runnerContainer.Env = append(runnerContainer.Env, corev1.EnvVar{
+		Name:  EnvVarVMINamespace,    // Use the new constant
+		Value: DefaultVMINamespace, // Use the new constant
+	})
+
 	if containerMode == "kubernetes" {
 		hookEnvs, err := runnerHookEnvs(&template)
 		if err != nil {
@@ -1414,4 +1494,34 @@ func isRequireSameNode(pod *corev1.Pod) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+func getRunnerEnv(pod *corev1.Pod, name string) string {
+	for _, c := range pod.Spec.Containers {
+		if c.Name == containerName { // Assuming 'runner' is the main container name
+			for _, e := range c.Env {
+				if e.Name == name {
+					return e.Value
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func setRunnerEnv(pod *corev1.Pod, name, value string) {
+	for i, c := range pod.Spec.Containers {
+		if c.Name == containerName { // Assuming 'runner' is the main container name
+			// Check if env var already exists
+			for j, e := range c.Env {
+				if e.Name == name {
+					pod.Spec.Containers[i].Env[j].Value = value
+					return
+				}
+			}
+			// If not, add it
+			pod.Spec.Containers[i].Env = append(pod.Spec.Containers[i].Env, corev1.EnvVar{Name: name, Value: value})
+			return
+		}
+	}
 }
