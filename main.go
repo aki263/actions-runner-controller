@@ -34,6 +34,7 @@ import (
 	"github.com/actions/actions-runner-controller/logging"
 	"github.com/kelseyhightower/envconfig"
 	corev1 "k8s.io/api/core/v1"
+	kubevirtv1 "kubevirt.io/api/core/v1" // Added Kubevirt API import
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
@@ -57,6 +58,7 @@ func init() {
 	_ = clientgoscheme.AddToScheme(scheme)
 	_ = githubv1alpha1.AddToScheme(scheme)
 	_ = summerwindv1alpha1.AddToScheme(scheme)
+	_ = kubevirtv1.AddToScheme(scheme) // Added Kubevirt scheme
 	// +kubebuilder:scaffold:scheme
 }
 
