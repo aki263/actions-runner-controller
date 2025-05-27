@@ -235,7 +235,11 @@ func (c *MultiGitHubClient) initClientWithSecretName(ctx context.Context, ns, se
 
 	var sec corev1.Secret
 	if err := c.client.Get(ctx, types.NamespacedName{Namespace: ns, Name: secretName}, &sec); err != nil {
-		return nil, err
+		// Wrap the error to add more context
+		wrappedError := fmt.Errorf("failed to get GitHub API credentials secret '%s' in namespace '%s': %w", secretName, ns, err)
+		// It's also good practice for the MultiGitHubClient itself to have a logger if it's going to log,
+		// but for now, just wrapping the error will improve the context for the caller's logger.
+		return nil, wrappedError
 	}
 
 	savedClient, err := c.initClientForSecret(&sec, runRef)
