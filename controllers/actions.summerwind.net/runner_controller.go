@@ -766,8 +766,12 @@ func (r *RunnerReconciler) newPod(runner v1alpha1.Runner) (corev1.Pod, error) {
 
 	pod.Name = runner.Name
 
-	// Inject the registration token and the runner name
-	updated := mutatePod(&pod, runner.Status.Registration.Token)
+	// Inject the registration token and the runner name (done by original mutatePod)
+	updated := mutatePod(&pod, runner.Status.Registration.Token) // Now calls the 2-argument version
+
+	// Explicitly set RUNNER_CR_UID environment variable.
+	// RUNNER_CR_NAME and RUNNER_CR_NAMESPACE are set in newRunnerPodWithContainerMode.
+	setRunnerEnv(updated, "RUNNER_CR_UID", string(runner.UID))
 
 	if err := ctrl.SetControllerReference(&runner, updated, r.Scheme); err != nil {
 		return pod, err
@@ -776,7 +780,7 @@ func (r *RunnerReconciler) newPod(runner v1alpha1.Runner) (corev1.Pod, error) {
 	return *updated, nil
 }
 
-func mutatePod(pod *corev1.Pod, token string, runnerUID string) *corev1.Pod { // Added runnerUID parameter
+func mutatePod(pod *corev1.Pod, token string) *corev1.Pod {
 	updated := pod.DeepCopy()
 
 	if getRunnerEnv(pod, EnvVarRunnerName) == "" {
@@ -785,11 +789,6 @@ func mutatePod(pod *corev1.Pod, token string, runnerUID string) *corev1.Pod { //
 
 	if getRunnerEnv(pod, EnvVarRunnerToken) == "" {
 		setRunnerEnv(updated, EnvVarRunnerToken, token)
-	}
-
-	// Inject RUNNER_CR_UID
-	if getRunnerEnv(pod, "RUNNER_CR_UID") == "" {
-		setRunnerEnv(updated, "RUNNER_CR_UID", runnerUID)
 	}
 
 	return updated

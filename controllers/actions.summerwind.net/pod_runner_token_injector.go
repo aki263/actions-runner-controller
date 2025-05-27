@@ -45,16 +45,18 @@ func (t *PodRunnerTokenInjector) Handle(ctx context.Context, req admission.Reque
 	}
 
 	var runnerContainer *corev1.Container
-
+	// Loop through containers to find the one named "runner"
 	for i := range pod.Spec.Containers {
-		c := pod.Spec.Containers[i]
-
-		if c.Name == "runner" {
-			runnerContainer = &c
+		// Correctly get a pointer to the container in the slice
+		if pod.Spec.Containers[i].Name == "runner" {
+			runnerContainer = &pod.Spec.Containers[i]
+			break // Found the runner container, exit loop
 		}
 	}
 
 	if runnerContainer == nil {
+		// Log if the runner container is not found and return an empty response.
+		t.Log.V(1).Info("Pod does not have a 'runner' container, skipping token injection", "podName", pod.Name, "podNamespace", pod.Namespace)
 		return newEmptyResponse()
 	}
 
