@@ -28,7 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kubevirtv1 "kubevirt.io/api/core/v1"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil" // For SetControllerReference if not already used for VMIs
+	// "sigs.k8s.io/controller-runtime/pkg/controller/controllerutil" // For SetControllerReference if not already used for VMIs - REMOVED
 
 	"github.com/actions/actions-runner-controller/build"
 	"github.com/actions/actions-runner-controller/hash"
@@ -43,10 +43,14 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	// metav1 "k8s.io/apimachinery/pkg/apis/meta/v1" // REMOVED - duplicate
 
 	"github.com/actions/actions-runner-controller/apis/actions.summerwind.net/v1alpha1"
 )
+
+// Note: controllerutil.SetControllerReference is still used in createObject, ensure ctrl "sigs.k8s.io/controller-runtime" is imported
+// and it provides this utility or add "sigs.k8s.io/controller-runtime/pkg/controller/controllerutil" if it was a mistake.
+// For now, assuming ctrl.SetControllerReference is the correct usage from "sigs.k8s.io/controller-runtime" import.
 
 const (
 	containerName = "runner"

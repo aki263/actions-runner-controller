@@ -365,34 +365,6 @@ func podRunnerID(pod *corev1.Pod) string {
 	return id
 }
 
-func getRunnerEnv(pod *corev1.Pod, key string) string {
-	for _, c := range pod.Spec.Containers {
-		if c.Name == containerName {
-			for _, e := range c.Env {
-				if e.Name == key {
-					return e.Value
-				}
-			}
-		}
-	}
-	return ""
-}
-
-func setRunnerEnv(pod *corev1.Pod, key, value string) {
-	for i := range pod.Spec.Containers {
-		c := pod.Spec.Containers[i]
-		if c.Name == containerName {
-			for j, env := range c.Env {
-				if env.Name == key {
-					pod.Spec.Containers[i].Env[j].Value = value
-					return
-				}
-			}
-			pod.Spec.Containers[i].Env = append(c.Env, corev1.EnvVar{Name: key, Value: value})
-		}
-	}
-}
-
 // unregisterRunner unregisters the runner from GitHub Actions by name.
 //
 // This function returns:
