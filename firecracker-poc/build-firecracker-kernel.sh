@@ -103,12 +103,12 @@ download_kernel_source() {
 }
 
 download_base_config() {
-    print_header "Downloading Base Firecracker Config"
+    print_header "Downloading Base Firecracker Config" >&2
     
     local config_file="microvm-kernel-x86_64-${KERNEL_MAJOR_VERSION}.config"
     
     if [ ! -f "${config_file}" ]; then
-        print_info "Downloading base kernel config for ${KERNEL_MAJOR_VERSION}..."
+        print_info "Downloading base kernel config for ${KERNEL_MAJOR_VERSION}..." >&2
         
         # Try different config file locations, with user's specific URL as primary
         local config_urls=(
@@ -120,28 +120,29 @@ download_base_config() {
         
         local downloaded=false
         for url in "${config_urls[@]}"; do
-            print_info "Trying to download from: $url"
+            print_info "Trying to download from: $url" >&2
             if curl -fsSL "$url" -o "${config_file}" 2>/dev/null; then
-                print_info "✅ Downloaded base config from: $url"
-                print_info "Config file size: $(du -h "${config_file}" | cut -f1)"
+                print_info "✅ Downloaded base config from: $url" >&2
+                print_info "Config file size: $(du -h "${config_file}" | cut -f1)" >&2
                 downloaded=true
                 break
             else
-                print_warning "⚠️ Failed to download from: $url"
+                print_warning "⚠️ Failed to download from: $url" >&2
             fi
         done
         
         if [ "$downloaded" = false ]; then
-            print_error "Failed to download base kernel config"
-            print_info "You can manually download a config file and place it at: ${BUILD_DIR}/${config_file}"
+            print_error "Failed to download base kernel config" >&2
+            print_info "You can manually download a config file and place it at: ${BUILD_DIR}/${config_file}" >&2
             exit 1
         fi
     else
-        print_info "Base config already exists: ${config_file}"
-        print_info "Config file size: $(du -h "${config_file}" | cut -f1)"
+        print_info "Base config already exists: ${config_file}" >&2
+        print_info "Config file size: $(du -h "${config_file}" | cut -f1)" >&2
     fi
     
-    echo "${config_file}"
+    # Return the config filename on stdout without any formatting
+    printf "%s" "${config_file}"
 }
 
 customize_kernel_config() {
