@@ -160,6 +160,23 @@ customize_kernel_config() {
     
     print_info "Applying container-friendly kernel modifications..."
     
+    # Essential Firecracker/VirtIO drivers (must be enabled for basic functionality)
+    print_info "Enabling essential VirtIO drivers for Firecracker..."
+    sed -i 's/^# CONFIG_VIRTIO.*/CONFIG_VIRTIO=y/' .config || echo "CONFIG_VIRTIO=y" >> .config
+    sed -i 's/^# CONFIG_VIRTIO_PCI.*/CONFIG_VIRTIO_PCI=y/' .config || echo "CONFIG_VIRTIO_PCI=y" >> .config
+    sed -i 's/^# CONFIG_VIRTIO_BLK.*/CONFIG_VIRTIO_BLK=y/' .config || echo "CONFIG_VIRTIO_BLK=y" >> .config
+    sed -i 's/^# CONFIG_VIRTIO_NET.*/CONFIG_VIRTIO_NET=y/' .config || echo "CONFIG_VIRTIO_NET=y" >> .config
+    sed -i 's/^# CONFIG_VIRTIO_CONSOLE.*/CONFIG_VIRTIO_CONSOLE=y/' .config || echo "CONFIG_VIRTIO_CONSOLE=y" >> .config
+    sed -i 's/^# CONFIG_HW_RANDOM_VIRTIO.*/CONFIG_HW_RANDOM_VIRTIO=y/' .config || echo "CONFIG_HW_RANDOM_VIRTIO=y" >> .config
+    
+    # Block device support
+    sed -i 's/^# CONFIG_BLOCK.*/CONFIG_BLOCK=y/' .config || echo "CONFIG_BLOCK=y" >> .config
+    sed -i 's/^# CONFIG_BLK_DEV.*/CONFIG_BLK_DEV=y/' .config || echo "CONFIG_BLK_DEV=y" >> .config
+    
+    # Essential filesystems
+    sed -i 's/^# CONFIG_EXT4_FS.*/CONFIG_EXT4_FS=y/' .config || echo "CONFIG_EXT4_FS=y" >> .config
+    sed -i 's/^# CONFIG_EXT4_USE_FOR_EXT2.*/CONFIG_EXT4_USE_FOR_EXT2=y/' .config || echo "CONFIG_EXT4_USE_FOR_EXT2=y" >> .config
+    
     # Enable container and networking features based on Felipe Cruz's blog
     # Reference: https://www.felipecruz.es/exploring-firecracker-microvms-for-multi-tenant-dagger-ci-cd-pipelines/
     
@@ -281,6 +298,8 @@ show_kernel_info() {
     echo ""
     
     echo -e "${GREEN}Container Features Enabled:${NC}"
+    echo "  ✅ Essential VirtIO drivers (block, network, console)"
+    echo "  ✅ EXT4 filesystem support"
     echo "  ✅ Namespaces (UTS, IPC, PID, NET, USER)"
     echo "  ✅ Cgroups (CPU, Memory, Devices, Freezer)"
     echo "  ✅ Netfilter/iptables (IPv4 and IPv6)"
