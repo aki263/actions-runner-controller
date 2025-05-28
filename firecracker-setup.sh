@@ -88,28 +88,8 @@ download_kernel() {
     if [ ! -f "${kernel_file}" ]; then
         print_info "Downloading Firecracker kernel ${KERNEL_VERSION}..."
         
-        # Download the appropriate kernel based on version
-        case "${KERNEL_VERSION}" in
-            "6.1.128")
-                curl -fsSL -o "${kernel_file}" \
-                    "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/x86_64/vmlinux-6.1.128"
-                    
-                ;;
-            "6.1.55"|"6.1")
-                curl -fsSL -o "${kernel_file}" \
-                    "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.7/x86_64/vmlinux-6.1.55"
-                ;;
-            "5.10")
-                curl -fsSL -o "${kernel_file}" \
-                    "https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/kernels/vmlinux.bin"
-                ;;
-            *)
-                print_error "Unsupported kernel version: ${KERNEL_VERSION}"
-                print_info "Supported versions: 5.10, 6.1.55, 6.1.128"
-                print_info "You can also manually place a kernel file at ${kernel_file}"
-                exit 1
-                ;;
-        esac
+        curl -fsSL -o "${kernel_file}" \
+            "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/x86_64/vmlinux-6.1.128"
         
         print_info "Kernel downloaded: ${kernel_file}"
     else
