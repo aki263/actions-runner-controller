@@ -110,8 +110,9 @@ download_base_config() {
     if [ ! -f "${config_file}" ]; then
         print_info "Downloading base kernel config for ${KERNEL_MAJOR_VERSION}..."
         
-        # Try different config file locations
+        # Try different config file locations, with user's specific URL as primary
         local config_urls=(
+            "https://raw.githubusercontent.com/firecracker-microvm/firecracker/refs/heads/main/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
             "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/${config_file}"
             "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-x86_64-6.1.config"
             "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-x86_64-5.10.config"
@@ -119,10 +120,14 @@ download_base_config() {
         
         local downloaded=false
         for url in "${config_urls[@]}"; do
+            print_info "Trying to download from: $url"
             if curl -fsSL "$url" -o "${config_file}" 2>/dev/null; then
-                print_info "Downloaded base config from: $url"
+                print_info "✅ Downloaded base config from: $url"
+                print_info "Config file size: $(du -h "${config_file}" | cut -f1)"
                 downloaded=true
                 break
+            else
+                print_warning "⚠️ Failed to download from: $url"
             fi
         done
         
@@ -133,6 +138,7 @@ download_base_config() {
         fi
     else
         print_info "Base config already exists: ${config_file}"
+        print_info "Config file size: $(du -h "${config_file}" | cut -f1)"
     fi
     
     echo "${config_file}"
@@ -148,6 +154,8 @@ customize_kernel_config() {
     
     # Copy base config
     cp "../${base_config}" .config
+    print_info "Copied base config to: ${kernel_dir}/.config"
+
     
     print_info "Applying container-friendly kernel modifications..."
     
@@ -363,6 +371,7 @@ main() {
     
     local base_config
     base_config=$(download_base_config)
+    
     
     customize_kernel_config "${base_config}"
     
