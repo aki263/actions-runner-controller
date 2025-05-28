@@ -158,8 +158,13 @@ DNS=8.8.8.8
 DNS=8.8.4.4
 EOF
         
-        # Enable systemd-networkd
+        # Enable systemd-networkd and disable NetworkManager
         sudo chroot "${mount_dir}" systemctl enable systemd-networkd
+        sudo chroot "${mount_dir}" systemctl enable systemd-resolved
+        sudo chroot "${mount_dir}" systemctl disable NetworkManager 2>/dev/null || true
+        
+        # Create resolv.conf symlink for systemd-resolved
+        sudo chroot "${mount_dir}" ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
         
         # Configure SSH
         sudo mkdir -p "${mount_dir}/root/.ssh"
@@ -174,24 +179,77 @@ EOF
         # Copy public key to VM
         sudo cp "${SSH_KEY_PATH}.pub" "${mount_dir}/root/.ssh/authorized_keys"
         sudo chmod 600 "${mount_dir}/root/.ssh/authorized_keys"
+        sudo chown root:root "${mount_dir}/root/.ssh/authorized_keys"
         
         # Configure SSH server
         sudo tee "${mount_dir}/etc/ssh/sshd_config.d/firecracker.conf" > /dev/null <<EOF
 PermitRootLogin yes
 PasswordAuthentication no
 PubkeyAuthentication yes
+Port 22
+AddressFamily inet
+ListenAddress 0.0.0.0
 EOF
         
         # Enable SSH service
         sudo chroot "${mount_dir}" systemctl enable ssh
         
-        # Set up console auto-login for root
+        # Create a network startup script to ensure networking is ready
+        sudo tee "${mount_dir}/etc/systemd/system/firecracker-network.service" > /dev/null <<EOF
+[Unit]
+Description=Firecracker Network Setup
+After=systemd-networkd.service
+Wants=systemd-networkd.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'ip link set eth0 up && systemctl restart systemd-networkd'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        
+        sudo chroot "${mount_dir}" systemctl enable firecracker-network.service
+        
+        # Set up console auto-login for root (for debugging)
         sudo mkdir -p "${mount_dir}/etc/systemd/system/serial-getty@ttyS0.service.d"
         sudo tee "${mount_dir}/etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf" > /dev/null <<EOF
 [Service]
 ExecStart=
 ExecStart=-/sbin/agetty --autologin root -o '-p -- \\u' --keep-baud 115200,38400,9600 %I \$TERM
 EOF
+        
+        # Create a network debugging script
+        sudo tee "${mount_dir}/root/debug-network.sh" > /dev/null <<'EOF'
+#!/bin/bash
+echo "=== Network Debug Information ==="
+echo "Date: $(date)"
+echo ""
+echo "Network interfaces:"
+ip addr show
+echo ""
+echo "Routing table:"
+ip route show
+echo ""
+echo "DNS configuration:"
+cat /etc/resolv.conf
+echo ""
+echo "SSH service status:"
+systemctl status ssh --no-pager
+echo ""
+echo "Network service status:"
+systemctl status systemd-networkd --no-pager
+echo ""
+echo "Testing connectivity:"
+echo "  Ping gateway (${HOST_IP}):"
+ping -c 3 172.20.0.1 || echo "  Gateway ping failed"
+echo "  Ping DNS (8.8.8.8):"
+ping -c 3 8.8.8.8 || echo "  DNS ping failed"
+echo "================================="
+EOF
+        
+        sudo chmod +x "${mount_dir}/root/debug-network.sh"
         
         # Create a simple welcome script
         sudo tee "${mount_dir}/root/welcome.sh" > /dev/null <<'EOF'
@@ -243,14 +301,31 @@ setup_networking() {
     # Enable IP forwarding
     echo 1 | sudo tee /proc/sys/net/ipv4/ip_forward > /dev/null
     
-    # Set up iptables rules for NAT
-    sudo iptables -t nat -A POSTROUTING -s "${HOST_IP%.*}.0/24" ! -o "${TAP_DEVICE}" -j MASQUERADE
+    # Make IP forwarding persistent
+    echo 'net.ipv4.ip_forward=1' | sudo tee -a /etc/sysctl.conf > /dev/null || true
+    
+    # Set up iptables rules for NAT (more comprehensive)
+    print_info "Setting up iptables rules for NAT..."
+    
+    # Allow traffic from VM to internet
+    sudo iptables -t nat -A POSTROUTING -s "${VM_IP}/32" -j MASQUERADE
+    
+    # Allow established and related connections
     sudo iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-    sudo iptables -A FORWARD -i "${TAP_DEVICE}" -o "${TAP_DEVICE}" -j ACCEPT
+    
+    # Allow traffic from TAP device
+    sudo iptables -A FORWARD -i "${TAP_DEVICE}" -j ACCEPT
+    
+    # Allow traffic to TAP device
+    sudo iptables -A FORWARD -o "${TAP_DEVICE}" -j ACCEPT
+    
+    # Allow SSH traffic to VM
+    sudo iptables -A INPUT -i "${TAP_DEVICE}" -p tcp --dport 22 -j ACCEPT
     
     print_info "Networking configured"
     print_info "Host IP: ${HOST_IP}"
     print_info "VM IP: ${VM_IP}"
+    print_info "TAP device: ${TAP_DEVICE}"
 }
 
 create_vm_config() {
@@ -262,7 +337,7 @@ create_vm_config() {
 {
   "boot-source": {
     "kernel_image_path": "${WORK_DIR}/vmlinux-${KERNEL_VERSION}",
-    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off nomodules rw ip=${VM_IP}::${HOST_IP}:255.255.255.0::eth0:off"
+    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off nomodules rw root=/dev/vda rootfstype=ext4 ip=${VM_IP}::${HOST_IP}:255.255.255.0::eth0:on"
   },
   "drives": [
     {
@@ -324,7 +399,7 @@ start_firecracker() {
         -H "Content-Type: application/json" \
         -d "{
             \"kernel_image_path\": \"${WORK_DIR}/vmlinux-${KERNEL_VERSION}\",
-            \"boot_args\": \"console=ttyS0 reboot=k panic=1 pci=off nomodules rw ip=${VM_IP}::${HOST_IP}:255.255.255.0::eth0:off\"
+            \"boot_args\": \"console=ttyS0 reboot=k panic=1 pci=off nomodules rw root=/dev/vda rootfstype=ext4 ip=${VM_IP}::${HOST_IP}:255.255.255.0::eth0:on\"
         }" \
         http://localhost/boot-source > /dev/null
     
@@ -372,21 +447,53 @@ start_firecracker() {
 wait_for_ssh() {
     print_header "Waiting for SSH to be Ready"
     
-    local max_attempts=30
+    local max_attempts=60
     local attempt=1
     
+    print_info "Testing network connectivity first..."
+    
+    # Wait for VM to boot and network to be ready
+    sleep 10
+    
     while [ $attempt -le $max_attempts ]; do
-        if ssh -i "${SSH_KEY_PATH}" -o ConnectTimeout=5 -o StrictHostKeyChecking=no root@"${VM_IP}" 'echo "SSH is ready"' &> /dev/null; then
-            print_info "SSH is ready!"
-            return 0
+        # Test basic connectivity first
+        if ping -c 1 -W 2 "${VM_IP}" &> /dev/null; then
+            print_info "VM is reachable via ping"
+            
+            # Test SSH connectivity
+            if ssh -i "${SSH_KEY_PATH}" -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"${VM_IP}" 'echo "SSH is ready"' &> /dev/null; then
+                print_info "SSH is ready!"
+                return 0
+            else
+                print_info "VM is pingable but SSH not ready yet..."
+            fi
+        else
+            print_info "VM not yet reachable via ping..."
         fi
         
         print_info "Attempt ${attempt}/${max_attempts}: Waiting for SSH..."
-        sleep 2
+        sleep 3
         ((attempt++))
     done
     
     print_warning "SSH did not become ready within the timeout period"
+    print_info "Debugging information:"
+    print_info "  VM IP: ${VM_IP}"
+    print_info "  Host IP: ${HOST_IP}"
+    print_info "  TAP device: ${TAP_DEVICE}"
+    
+    # Show network status
+    if ip link show "${TAP_DEVICE}" &> /dev/null; then
+        print_info "  TAP device status: UP"
+        ip addr show "${TAP_DEVICE}" | grep inet || true
+    else
+        print_warning "  TAP device not found!"
+    fi
+    
+    # Test manual ping
+    print_info "Testing manual ping to VM..."
+    ping -c 3 "${VM_IP}" || print_warning "Ping failed"
+    
     return 1
 }
 

@@ -233,6 +233,40 @@ cleanup_all() {
     print_info "Cleanup completed"
 }
 
+killall_firecracker() {
+    print_header "Emergency: Killing All Firecracker Processes"
+    
+    print_warning "This will forcefully terminate ALL Firecracker processes on the system!"
+    
+    # Find all firecracker processes
+    local pids
+    pids=$(pgrep -f firecracker || true)
+    
+    if [ -z "$pids" ]; then
+        print_info "No Firecracker processes found"
+        return 0
+    fi
+    
+    print_info "Found Firecracker processes: $pids"
+    
+    # Kill them all
+    echo "$pids" | xargs kill -9 2>/dev/null || true
+    
+    # Clean up any TAP devices
+    for tap_device in $(ip link show | grep "tap-" | awk -F': ' '{print $2}' | grep "tap-" || true); do
+        print_info "Removing TAP device: ${tap_device}"
+        sudo ip link delete "${tap_device}" 2>/dev/null || true
+    done
+    
+    # Clean up PID files
+    if [ -d "${WORK_DIR}" ]; then
+        rm -f "${WORK_DIR}"/firecracker-*.pid || true
+        rm -f "${WORK_DIR}"/firecracker-*.socket || true
+    fi
+    
+    print_info "All Firecracker processes terminated"
+}
+
 show_ssh_info() {
     local vm_id="$1"
     local ssh_key="${WORK_DIR}/vm_key"
@@ -265,6 +299,7 @@ usage() {
     echo "  list                      List all VMs"
     echo "  resize <vm_id> <size>     Resize rootfs (VM must be stopped)"
     echo "  cleanup                   Stop all VMs and clean up"
+    echo "  killall                   Emergency: Kill all Firecracker processes"
     echo "  ssh <vm_id>               Show SSH connection information"
     echo "  help                      Show this help message"
     echo ""
@@ -274,6 +309,7 @@ usage() {
     echo "  $0 resize abc123 20G"
     echo "  $0 list"
     echo "  $0 cleanup"
+    echo "  $0 killall                # Emergency use only"
 }
 
 main() {
@@ -313,6 +349,9 @@ main() {
             ;;
         cleanup)
             cleanup_all
+            ;;
+        killall)
+            killall_firecracker
             ;;
         ssh)
             if [ $# -ne 1 ]; then

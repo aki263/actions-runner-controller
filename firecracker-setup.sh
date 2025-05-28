@@ -286,7 +286,7 @@ create_vm_config() {
 {
   "boot-source": {
     "kernel_image_path": "${WORK_DIR}/vmlinux-${KERNEL_VERSION}",
-    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off nomodules rw ip=${VM_IP}::${HOST_IP}:255.255.255.0::eth0:off"
+    "boot_args": "console=ttyS0 reboot=k panic=1 pci=on nomodules rw ip=${VM_IP}::${HOST_IP}:255.255.255.0::eth0:off"
   },
   "drives": [
     {

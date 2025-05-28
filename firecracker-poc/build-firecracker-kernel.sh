@@ -113,9 +113,6 @@ download_base_config() {
         # Try different config file locations, with user's specific URL as primary
         local config_urls=(
             "https://raw.githubusercontent.com/firecracker-microvm/firecracker/refs/heads/main/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
-            "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/${config_file}"
-            "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-x86_64-6.1.config"
-            "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-x86_64-5.10.config"
         )
         
         local downloaded=false
@@ -252,38 +249,39 @@ customize_kernel_config() {
 }
 
 build_kernel() {
-    print_header "Building Kernel"
+    print_header "Building Kernel" >&2
     
     local kernel_dir="linux-${KERNEL_VERSION}"
     
     cd "${kernel_dir}"
     
-    print_info "Starting kernel build with ${JOBS} parallel jobs..."
-    print_info "This may take 15-45 minutes depending on your system..."
+    print_info "Starting kernel build with ${JOBS} parallel jobs..." >&2
+    print_info "This may take 15-45 minutes depending on your system..." >&2
     
     # Build the kernel
     make -j"${JOBS}" vmlinux
     
     # Check if build was successful
     if [ ! -f "vmlinux" ]; then
-        print_error "Kernel build failed - vmlinux not found"
+        print_error "Kernel build failed - vmlinux not found" >&2
         exit 1
     fi
     
-    print_info "Kernel build completed successfully!"
+    print_info "Kernel build completed successfully!" >&2
     
     # Copy to output directory
     local output_kernel="${OUTPUT_DIR}/vmlinux-${KERNEL_VERSION}-custom"
     cp vmlinux "${output_kernel}"
     
-    print_info "Kernel copied to: ${output_kernel}"
+    print_info "Kernel copied to: ${output_kernel}" >&2
     
     # Create a symlink for easy reference
     ln -sf "vmlinux-${KERNEL_VERSION}-custom" "${OUTPUT_DIR}/vmlinux-custom"
     
     cd ..
     
-    echo "${output_kernel}"
+    # Return only the kernel path to stdout
+    printf "%s" "${output_kernel}"
 }
 
 show_kernel_info() {
