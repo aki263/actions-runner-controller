@@ -114,8 +114,36 @@ clone_firecracker_repo() {
     
     if [ ! -d "${firecracker_dir}" ]; then
         print_info "Cloning Firecracker repository..."
-        git clone --depth 1 https://github.com/firecracker-microvm/firecracker.git
-        print_info "Firecracker repository cloned"
+        
+        # Check if git is available
+        if ! command -v git &> /dev/null; then
+            print_error "Git is not installed. Please install it first:"
+            print_info "  sudo apt update && sudo apt install -y git"
+            exit 1
+        fi
+        
+        # Clone with explicit error handling
+        if ! git clone --depth 1 https://github.com/firecracker-microvm/firecracker.git; then
+            print_error "Failed to clone Firecracker repository"
+            print_info "This could be due to:"
+            print_info "  1. Network connectivity issues"
+            print_info "  2. Git not properly installed"
+            print_info "  3. GitHub access issues"
+            print_info "Please check your internet connection and try again"
+            exit 1
+        fi
+        
+        print_info "Firecracker repository cloned successfully"
+        
+        # Verify the clone was successful and contains expected files
+        if [ ! -d "${firecracker_dir}/resources/guest_configs" ]; then
+            print_error "Cloned repository is incomplete - missing guest_configs directory"
+            print_info "Removing incomplete clone and exiting"
+            rm -rf "${firecracker_dir}"
+            exit 1
+        fi
+        
+        print_info "Repository structure verified"
     else
         print_info "Firecracker repository already exists"
         cd "${firecracker_dir}"
