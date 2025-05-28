@@ -20,11 +20,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"k8s.io/apimachinery/pkg/api/resource"
 	"reflect"
 	"strconv"
 	"strings"
 	"time"
+
+	"k8s.io/apimachinery/pkg/api/resource"
 
 	"github.com/actions/actions-runner-controller/build"
 	"github.com/actions/actions-runner-controller/hash"
@@ -38,7 +39,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	corev1 "k8s.io/api/core/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/actions/actions-runner-controller/apis/actions.summerwind.net/v1alpha1"
@@ -86,11 +86,19 @@ type RunnerPodDefaults struct {
 	DockerGID string
 
 	UseRunnerStatusUpdateHook bool
+
+	// Firecracker VM defaults
+	DefaultMemoryMiB int
+	DefaultVCPUs     int
+	RootfsPath       string
+	KernelPath       string
 }
 
 // +kubebuilder:rbac:groups=actions.summerwind.dev,resources=runners,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=actions.summerwind.dev,resources=runners/finalizers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=actions.summerwind.dev,resources=runners/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=actions.summerwind.dev,resources=firecrackervm,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=actions.summerwind.dev,resources=firecrackervm/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups=core,resources=pods/finalizers,verbs=get;list;watch;create;update;patch;delete
@@ -123,51 +131,51 @@ func (r *RunnerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 	} else {
 		// Request to remove a runner. DeletionTimestamp was set in the runner - we need to unregister runner
-		var pod corev1.Pod
-		if err := r.Get(ctx, req.NamespacedName, &pod); err != nil {
+		var vm v1alpha1.FirecrackerVM
+		if err := r.Get(ctx, req.NamespacedName, &vm); err != nil {
 			if !kerrors.IsNotFound(err) {
-				log.Info(fmt.Sprintf("Retrying soon as we failed to get runner pod: %v", err))
+				log.Info(fmt.Sprintf("Retrying soon as we failed to get runner FirecrackerVM: %v", err))
 				return ctrl.Result{Requeue: true}, nil
 			}
-			// Pod was not found
+			// VM was not found
 			return r.processRunnerDeletion(runner, ctx, log, nil)
 		}
 
 		r.GitHubClient.DeinitForRunner(&runner)
 
-		return r.processRunnerDeletion(runner, ctx, log, &pod)
+		return r.processRunnerDeletion(runner, ctx, log, &vm)
 	}
 
-	var pod corev1.Pod
-	if err := r.Get(ctx, req.NamespacedName, &pod); err != nil {
+	var vm v1alpha1.FirecrackerVM
+	if err := r.Get(ctx, req.NamespacedName, &vm); err != nil {
 		if !kerrors.IsNotFound(err) {
-			// An error ocurred
+			// An error occurred
 			return ctrl.Result{}, err
 		}
 		return r.processRunnerCreation(ctx, runner, log)
 	}
 
-	phase := string(pod.Status.Phase)
+	phase := string(vm.Status.Phase)
 	if phase == "" {
 		phase = "Created"
 	}
 
-	ready := runnerPodReady(&pod)
+	ready := vm.Status.Ready
 
 	if (runner.Status.Phase != phase || runner.Status.Ready != ready) && !r.RunnerPodDefaults.UseRunnerStatusUpdateHook || runner.Status.Phase == "" && r.RunnerPodDefaults.UseRunnerStatusUpdateHook {
-		if pod.Status.Phase == corev1.PodRunning {
+		if vm.Status.Phase == v1alpha1.FirecrackerVMPhaseReady {
 			// Seeing this message, you can expect the runner to become `Running` soon.
 			log.V(1).Info(
 				"Runner appears to have been registered and running.",
-				"podCreationTimestamp", pod.CreationTimestamp,
+				"vmCreationTimestamp", vm.CreationTimestamp,
 			)
 		}
 
 		updated := runner.DeepCopy()
 		updated.Status.Phase = phase
 		updated.Status.Ready = ready
-		updated.Status.Reason = pod.Status.Reason
-		updated.Status.Message = pod.Status.Message
+		updated.Status.Reason = vm.Status.Message
+		updated.Status.Message = vm.Status.Message
 
 		if err := r.Status().Patch(ctx, updated, client.MergeFrom(&runner)); err != nil {
 			log.Error(err, "Failed to update runner status for Phase/Reason/Message")
@@ -270,7 +278,7 @@ func ephemeralRunnerContainerStatus(pod *corev1.Pod) *corev1.ContainerStatus {
 	return nil
 }
 
-func (r *RunnerReconciler) processRunnerDeletion(runner v1alpha1.Runner, ctx context.Context, log logr.Logger, pod *corev1.Pod) (reconcile.Result, error) {
+func (r *RunnerReconciler) processRunnerDeletion(runner v1alpha1.Runner, ctx context.Context, log logr.Logger, vm interface{}) (reconcile.Result, error) {
 	finalizers, removed := removeFinalizer(runner.ObjectMeta.Finalizers, finalizerName)
 
 	if removed {
@@ -295,122 +303,61 @@ func (r *RunnerReconciler) processRunnerCreation(ctx context.Context, runner v1a
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	newPod, err := r.newPod(runner)
+	// Instead of creating a pod, create a FirecrackerVM
+	newVM, err := r.newFirecrackerVM(runner)
 	if err != nil {
-		log.Error(err, "Could not create pod")
+		log.Error(err, "Could not create FirecrackerVM")
 		return ctrl.Result{}, err
 	}
 
-	needsServiceAccount := runner.Spec.ServiceAccountName == "" && (r.RunnerPodDefaults.UseRunnerStatusUpdateHook || runner.Spec.ContainerMode == "kubernetes")
-	if needsServiceAccount {
-		serviceAccount := &corev1.ServiceAccount{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      runner.ObjectMeta.Name,
-				Namespace: runner.ObjectMeta.Namespace,
-			},
-		}
-		if res := r.createObject(ctx, serviceAccount, serviceAccount.ObjectMeta, &runner, log); res != nil {
-			return *res, nil
-		}
-
-		rules := []rbacv1.PolicyRule{}
-
-		if r.RunnerPodDefaults.UseRunnerStatusUpdateHook {
-			rules = append(rules, []rbacv1.PolicyRule{
-				{
-					APIGroups:     []string{"actions.summerwind.dev"},
-					Resources:     []string{"runners/status"},
-					Verbs:         []string{"get", "update", "patch"},
-					ResourceNames: []string{runner.ObjectMeta.Name},
-				},
-			}...)
-		}
-
-		if runner.Spec.ContainerMode == "kubernetes" {
-			// Permissions based on https://github.com/actions/runner-container-hooks/blob/main/packages/k8s/README.md
-			rules = append(rules, []rbacv1.PolicyRule{
-				{
-					APIGroups: []string{""},
-					Resources: []string{"pods"},
-					Verbs:     []string{"get", "list", "create", "delete"},
-				},
-				{
-					APIGroups: []string{""},
-					Resources: []string{"pods/exec"},
-					Verbs:     []string{"get", "create"},
-				},
-				{
-					APIGroups: []string{""},
-					Resources: []string{"pods/log"},
-					Verbs:     []string{"get", "list", "watch"},
-				},
-				{
-					APIGroups: []string{"batch"},
-					Resources: []string{"jobs"},
-					Verbs:     []string{"get", "list", "create", "delete"},
-				},
-				{
-					APIGroups: []string{""},
-					Resources: []string{"secrets"},
-					Verbs:     []string{"get", "list", "create", "delete"},
-				},
-			}...)
-		}
-
-		role := &rbacv1.Role{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      runner.ObjectMeta.Name,
-				Namespace: runner.ObjectMeta.Namespace,
-			},
-			Rules: rules,
-		}
-		if res := r.createObject(ctx, role, role.ObjectMeta, &runner, log); res != nil {
-			return *res, nil
-		}
-
-		roleBinding := &rbacv1.RoleBinding{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      runner.ObjectMeta.Name,
-				Namespace: runner.ObjectMeta.Namespace,
-			},
-			RoleRef: rbacv1.RoleRef{
-				APIGroup: "rbac.authorization.k8s.io",
-				Kind:     "Role",
-				Name:     runner.ObjectMeta.Name,
-			},
-			Subjects: []rbacv1.Subject{
-				{
-					Kind:      "ServiceAccount",
-					Name:      runner.ObjectMeta.Name,
-					Namespace: runner.ObjectMeta.Namespace,
-				},
-			},
-		}
-		if res := r.createObject(ctx, roleBinding, roleBinding.ObjectMeta, &runner, log); res != nil {
-			return *res, nil
-		}
+	// Set controller reference
+	if err := ctrl.SetControllerReference(&runner, &newVM, r.Scheme); err != nil {
+		return ctrl.Result{}, err
 	}
 
-	if err := r.Create(ctx, &newPod); err != nil {
+	// Create the FirecrackerVM
+	if err := r.Create(ctx, &newVM); err != nil {
 		if kerrors.IsAlreadyExists(err) {
-			// Gracefully handle pod-already-exists errors due to informer cache delay.
-			// Without this we got a few errors like the below on new runner pod:
-			// 2021-03-16T00:23:10.116Z        ERROR   controller-runtime.controller   Reconciler error      {"controller": "runner-controller", "request": "default/example-runnerdeploy-b2g2g-j4mcp", "error": "pods \"example-runnerdeploy-b2g2g-j4mcp\" already exists"}
 			log.Info(
-				"Failed to create pod due to AlreadyExists error. Probably this pod has been already created in previous reconcilation but is still not in the informer cache. Will retry on pod created. If it doesn't repeat, there's no problem",
+				"Failed to create FirecrackerVM due to AlreadyExists error. Probably this VM has been already created in previous reconciliation but is still not in the informer cache. Will retry on VM created. If it doesn't repeat, there's no problem",
 			)
 			return ctrl.Result{}, nil
 		}
 
-		log.Error(err, "Failed to create pod resource")
-
+		log.Error(err, "Failed to create FirecrackerVM resource")
 		return ctrl.Result{}, err
 	}
 
-	r.Recorder.Event(&runner, corev1.EventTypeNormal, "PodCreated", fmt.Sprintf("Created pod '%s'", newPod.Name))
-	log.Info("Created runner pod", "repository", runner.Spec.Repository)
+	r.Recorder.Event(&runner, corev1.EventTypeNormal, "FirecrackerVMCreated", fmt.Sprintf("Created FirecrackerVM '%s'", newVM.Name))
+	log.Info("Created runner FirecrackerVM", "repository", runner.Spec.Repository)
 
 	return ctrl.Result{}, nil
+}
+
+func (r *RunnerReconciler) newFirecrackerVM(runner v1alpha1.Runner) (v1alpha1.FirecrackerVM, error) {
+	labels := map[string]string{}
+	for k, v := range runner.ObjectMeta.Labels {
+		labels[k] = v
+	}
+
+	// Create FirecrackerVM with runner configuration
+	vm := v1alpha1.FirecrackerVM{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      runner.ObjectMeta.Name,
+			Namespace: runner.ObjectMeta.Namespace,
+			Labels:    labels,
+		},
+		Spec: v1alpha1.FirecrackerVMSpec{
+			RunnerSpec: runner.Spec.RunnerConfig,
+			// Use hardcoded defaults for now - these should be configurable
+			MemoryMiB:  1024, // 1GB
+			VCPUs:      2,
+			RootfsPath: "/var/lib/firecracker/images/ubuntu-20.04.ext4",
+			KernelPath: "/var/lib/firecracker/images/vmlinux.bin",
+		},
+	}
+
+	return vm, nil
 }
 
 func (r *RunnerReconciler) createObject(ctx context.Context, obj client.Object, meta metav1.ObjectMeta, runner *v1alpha1.Runner, log logr.Logger) *ctrl.Result {
@@ -1208,8 +1155,6 @@ func newRunnerPodWithContainerMode(containerMode string, template corev1.Pod, ru
 			//     link/ether 02:42:ab:1c:83:69 brd ff:ff:ff:ff:ff:ff
 			// 4: br-c5bf6c172bd7: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc noqueue state DOWN
 			//     link/ether 02:42:e2:91:13:1e brd ff:ff:ff:ff:ff:ff
-			// 8: veth767f1a5@if7: <BROADCAST,MULTICAST,UP,LOWER_UP,M-DOWN> mtu 1400 qdisc noqueue master docker0 state UP
-			//     link/ether 82:d5:08:28:d8:98 brd ff:ff:ff:ff:ff:ff
 			//
 			// # After 10 seconds sleep, you can see the container stops and the veth767f1a5@if7 interface got deleted:
 			//
