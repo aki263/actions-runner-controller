@@ -46,36 +46,99 @@ check_dependencies() {
     local deps=("curl" "tar" "make" "gcc" "flex" "bison" "bc" "git")
     local missing_deps=()
     
+    print_info "Testing command availability..."
     # Check basic tools
     for dep in "${deps[@]}"; do
         if ! command -v "$dep" &> /dev/null; then
             missing_deps+=("$dep")
-            print_error "Missing: $dep"
+            print_error "Missing command: $dep"
         else
-            print_info "Found: $dep"
+            print_info "✅ Found command: $dep at $(command -v "$dep")"
         fi
     done
     
-    # Check development packages
+    print_info ""
+    print_info "Testing package detection methods..."
+    
+    # Check development packages with multiple detection methods
     local dev_packages=("libssl-dev" "libelf-dev" "build-essential" "pkg-config")
+    local package_missing=false
+    
     for pkg in "${dev_packages[@]}"; do
-        if ! dpkg -l | grep -q "^ii.*$pkg" 2>/dev/null; then
-            missing_deps+=("$pkg")
-            print_error "Missing package: $pkg"
+        print_info "Testing package: $pkg"
+        
+        local found=false
+        local method_used=""
+        
+        # Method 1: dpkg-query
+        if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+            found=true
+            method_used="dpkg-query"
+        # Method 2: dpkg -l
+        elif dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
+            found=true
+            method_used="dpkg -l"
+        # Method 3: Special handling for build-essential
+        elif [[ "$pkg" == "build-essential" ]] && command -v gcc &> /dev/null && command -v make &> /dev/null && command -v g++ &> /dev/null; then
+            found=true
+            method_used="build tools check (gcc, make, g++)"
+        # Method 4: apt list
+        elif command -v apt &> /dev/null && apt list --installed "$pkg" 2>/dev/null | grep -q "installed"; then
+            found=true
+            method_used="apt list"
+        fi
+        
+        if [ "$found" = true ]; then
+            print_info "  ✅ $pkg: FOUND via $method_used"
         else
-            print_info "Found package: $pkg"
+            print_error "  ❌ $pkg: NOT FOUND"
+            missing_deps+=("$pkg")
+            package_missing=true
+            
+            # Show detailed debugging for this package
+            print_info "  Debug info for $pkg:"
+            
+            # Show dpkg-query output
+            local dpkg_status=$(dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null || echo "N/A")
+            print_info "    dpkg-query status: $dpkg_status"
+            
+            # Show dpkg -l output
+            print_info "    dpkg -l output:"
+            dpkg -l "$pkg" 2>/dev/null | head -3 | sed 's/^/      /' || print_info "      No dpkg output"
+            
+            # Show apt list output if available
+            if command -v apt &> /dev/null; then
+                print_info "    apt list output:"
+                apt list --installed "$pkg" 2>/dev/null | sed 's/^/      /' || print_info "      No apt output"
+            fi
         fi
     done
     
+    print_info ""
+    print_info "Summary:"
     if [ ${#missing_deps[@]} -ne 0 ]; then
         print_error "Missing dependencies: ${missing_deps[*]}"
-        print_info "Install them with:"
+        print_info ""
+        print_info "Install missing dependencies with:"
         print_info "  sudo apt update"
         print_info "  sudo apt install -y build-essential curl flex bison bc libssl-dev libelf-dev pkg-config git"
-        exit 1
+        print_info ""
+        print_info "Alternative: You can also try to force continue by editing the script"
+        print_info "and commenting out the 'exit 1' line below if you believe the packages are installed."
+        
+        debug_step "Dependencies failed - see details above"
+        
+        print_info "Do you want to continue anyway? This might fail later but will show more debugging info."
+        read -p "Continue despite missing dependencies? [y/N] " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            exit 1
+        fi
+        print_warning "Continuing with potentially missing dependencies..."
+    else
+        print_info "✅ All dependencies are satisfied"
     fi
     
-    print_info "All dependencies satisfied"
     debug_step "Dependencies check completed"
 }
 

@@ -76,11 +76,23 @@ check_dependencies() {
         fi
     done
     
-    # Check development packages
+    # Check development packages with better detection
     local dev_packages=("libssl-dev" "libelf-dev" "build-essential" "pkg-config")
     for pkg in "${dev_packages[@]}"; do
-        if ! dpkg -l | grep -q "^ii.*$pkg" 2>/dev/null; then
-            missing_deps+=("$pkg")
+        # Try multiple methods to check if package is installed
+        if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+            # Fallback method
+            if ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
+                # Additional fallback for build-essential which is a meta-package
+                if [[ "$pkg" == "build-essential" ]]; then
+                    # Check if essential build tools are available instead
+                    if command -v gcc &> /dev/null && command -v make &> /dev/null && command -v g++ &> /dev/null; then
+                        print_info "Build tools found (gcc, make, g++)"
+                        continue
+                    fi
+                fi
+                missing_deps+=("$pkg")
+            fi
         fi
     done
     
@@ -89,10 +101,28 @@ check_dependencies() {
         print_info "Install them with:"
         print_info "  sudo apt update"
         print_info "  sudo apt install -y build-essential curl flex bison bc libssl-dev libelf-dev pkg-config git"
+        
+        # Show what we actually found for debugging
+        print_info ""
+        print_info "Debugging package detection:"
+        for pkg in "${dev_packages[@]}"; do
+            if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+                print_info "✅ $pkg: installed (method 1)"
+            elif dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
+                print_info "✅ $pkg: installed (method 2)"
+            elif [[ "$pkg" == "build-essential" ]] && command -v gcc &> /dev/null; then
+                print_info "✅ $pkg: build tools available"
+            else
+                print_error "❌ $pkg: not found"
+                # Show what dpkg actually returns
+                print_info "   dpkg status: $(dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null || echo 'not available')"
+            fi
+        done
+        
         exit 1
     fi
     
-    print_info "All dependencies satisfied"
+    print_info "All dependencies are satisfied"
 }
 
 setup_build_environment() {
