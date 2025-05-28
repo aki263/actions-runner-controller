@@ -92,7 +92,8 @@ download_kernel() {
         case "${KERNEL_VERSION}" in
             "6.1.128")
                 curl -fsSL -o "${kernel_file}" \
-                    "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/x86_64/vmlinux-6.1.128"
+                    "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/x86_64/vmlinux-6.1.128"
+                    
                 ;;
             "6.1.55"|"6.1")
                 curl -fsSL -o "${kernel_file}" \
