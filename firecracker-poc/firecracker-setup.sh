@@ -54,10 +54,15 @@ check_dependencies() {
         fi
     done
     
+    # Check for ISO creation tools
+    if ! command -v genisoimage &> /dev/null && ! command -v mkisofs &> /dev/null; then
+        missing_deps+=("genisoimage")
+    fi
+    
     if [ ${#missing_deps[@]} -ne 0 ]; then
         print_error "Missing dependencies: ${missing_deps[*]}"
         print_info "Install them with:"
-        print_info "  Ubuntu/Debian: sudo apt update && sudo apt install -y curl qemu-utils debootstrap openssh-client"
+        print_info "  Ubuntu/Debian: sudo apt update && sudo apt install -y curl qemu-utils debootstrap openssh-client genisoimage"
         print_info "  Firecracker: curl -LOJ https://github.com/firecracker-microvm/firecracker/releases/latest/download/firecracker-v*-x86_64.tgz && tar -xzf firecracker-*.tgz && sudo mv release-*/firecracker-* /usr/local/bin/firecracker"
         exit 1
     fi
@@ -137,7 +142,7 @@ create_ubuntu_rootfs() {
         
         # Create Ubuntu 24.04 rootfs using debootstrap
         print_info "Installing Ubuntu 24.04 base system (this may take a while)..."
-        sudo debootstrap --include=openssh-server,curl,wget,vim,htop,net-tools,iputils-ping,systemd,init,udev,kmod,sudo,bash-completion,ca-certificates,gnupg,lsb-release \
+        sudo debootstrap --include=openssh-server,curl,wget,vim,htop,net-tools,iputils-ping,systemd,init,udev,kmod,sudo,bash-completion,ca-certificates,gnupg,lsb-release,cloud-init \
             noble "${mount_dir}" http://archive.ubuntu.com/ubuntu/
         
         # Configure the rootfs
@@ -345,6 +350,12 @@ create_vm_config() {
       "path_on_host": "${WORK_DIR}/ubuntu-24.04-rootfs.ext4",
       "is_root_device": true,
       "is_read_only": false
+    },
+    {
+      "drive_id": "cloudinit",
+      "path_on_host": "${WORK_DIR}/cloud-init.iso",
+      "is_root_device": false,
+      "is_read_only": true
     }
   ],
   "network-interfaces": [
@@ -415,6 +426,19 @@ start_firecracker() {
             \"is_read_only\": false
         }" \
         http://localhost/drives/rootfs > /dev/null
+    
+    # Configure cloud-init drive
+    curl -X PUT \
+        --unix-socket "${SOCKET_PATH}" \
+        -H "Accept: application/json" \
+        -H "Content-Type: application/json" \
+        -d "{
+            \"drive_id\": \"cloudinit\",
+            \"path_on_host\": \"${WORK_DIR}/cloud-init.iso\",
+            \"is_root_device\": false,
+            \"is_read_only\": true
+        }" \
+        http://localhost/drives/cloudinit > /dev/null
     
     # Configure network interface
     curl -X PUT \
@@ -548,6 +572,189 @@ increase_rootfs_size() {
     print_info "Rootfs resized to ${new_size}"
 }
 
+create_cloud_init_config() {
+    print_header "Creating Cloud-Init Configuration"
+    
+    local cloud_init_dir="${WORK_DIR}/cloud-init"
+    mkdir -p "${cloud_init_dir}"
+    
+    # Generate SSH key if it doesn't exist
+    if [ ! -f "${SSH_KEY_PATH}" ]; then
+        ssh-keygen -t rsa -b 4096 -f "${SSH_KEY_PATH}" -N "" -C "firecracker-vm"
+        print_info "SSH key generated: ${SSH_KEY_PATH}"
+    fi
+    
+    local ssh_public_key
+    ssh_public_key=$(cat "${SSH_KEY_PATH}.pub")
+    
+    # Create user-data (cloud-config)
+    cat > "${cloud_init_dir}/user-data" <<EOF
+#cloud-config
+
+# Set hostname
+hostname: firecracker-vm
+fqdn: firecracker-vm.local
+
+# Configure users
+users:
+  - name: root
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+  - name: ubuntu
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: sudo
+    lock_passwd: false
+    passwd: \$6\$rounds=4096\$saltsalt\$L9.LKkHxeed8Kn9.Qa1ykj7LMEqKVYxf1XkN1H2xKcNlKjY1K2K3K4K5K6K7K8K9K0
+
+# SSH configuration
+ssh_pwauth: false
+disable_root: false
+
+# Package updates and installs
+package_update: true
+package_upgrade: false
+packages:
+  - htop
+  - curl
+  - wget
+  - vim
+  - net-tools
+  - iputils-ping
+
+# Network configuration
+network:
+  version: 2
+  ethernets:
+    eth0:
+      addresses:
+        - ${VM_IP}/24
+      gateway4: ${HOST_IP}
+      nameservers:
+        addresses:
+          - 8.8.8.8
+          - 8.8.4.4
+
+# Write files
+write_files:
+  - path: /root/welcome.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      echo "=============================================="
+      echo "Welcome to Firecracker Ubuntu 24.04 VM!"
+      echo "=============================================="
+      echo "VM IP: \$(ip addr show eth0 | grep -oP 'inet \\K[\\d.]+')"
+      echo "SSH: ssh -i /path/to/vm_key root@\$(ip addr show eth0 | grep -oP 'inet \\K[\\d.]+')"
+      echo "=============================================="
+      echo "To install packages:"
+      echo "  apt update && apt install <package>"
+      echo "=============================================="
+  
+  - path: /root/debug-network.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      echo "=== Network Debug Information ==="
+      echo "Date: \$(date)"
+      echo ""
+      echo "Network interfaces:"
+      ip addr show
+      echo ""
+      echo "Routing table:"
+      ip route show
+      echo ""
+      echo "DNS configuration:"
+      cat /etc/resolv.conf
+      echo ""
+      echo "SSH service status:"
+      systemctl status ssh --no-pager
+      echo ""
+      echo "Cloud-init status:"
+      cloud-init status
+      echo ""
+      echo "Testing connectivity:"
+      echo "  Ping gateway (${HOST_IP}):"
+      ping -c 3 ${HOST_IP} || echo "  Gateway ping failed"
+      echo "  Ping DNS (8.8.8.8):"
+      ping -c 3 8.8.8.8 || echo "  DNS ping failed"
+      echo "================================="
+
+# Run commands
+runcmd:
+  - systemctl enable ssh
+  - systemctl start ssh
+  - systemctl enable systemd-networkd
+  - systemctl start systemd-networkd
+  - echo '/root/welcome.sh' >> /root/.bashrc
+
+# Final message
+final_message: "Firecracker VM is ready! SSH: ssh -i /path/to/vm_key root@${VM_IP}"
+EOF
+
+    # Create meta-data
+    cat > "${cloud_init_dir}/meta-data" <<EOF
+instance-id: firecracker-vm-${VM_ID}
+local-hostname: firecracker-vm
+EOF
+
+    # Create network-config (optional, as we're using user-data network config)
+    cat > "${cloud_init_dir}/network-config" <<EOF
+version: 2
+ethernets:
+  eth0:
+    addresses:
+      - ${VM_IP}/24
+    gateway4: ${HOST_IP}
+    nameservers:
+      addresses:
+        - 8.8.8.8
+        - 8.8.4.4
+EOF
+
+    print_info "Cloud-init configuration created in: ${cloud_init_dir}"
+}
+
+create_cloud_init_iso() {
+    print_header "Creating Cloud-Init ISO"
+    
+    local cloud_init_dir="${WORK_DIR}/cloud-init"
+    local cloud_init_iso="${WORK_DIR}/cloud-init.iso"
+    
+    if [ ! -d "${cloud_init_dir}" ]; then
+        print_error "Cloud-init directory not found. Run create_cloud_init_config first."
+        exit 1
+    fi
+    
+    # Check if genisoimage or mkisofs is available
+    if command -v genisoimage &> /dev/null; then
+        local iso_cmd="genisoimage"
+    elif command -v mkisofs &> /dev/null; then
+        local iso_cmd="mkisofs"
+    else
+        print_error "Neither genisoimage nor mkisofs found. Install with: sudo apt install genisoimage"
+        exit 1
+    fi
+    
+    print_info "Creating cloud-init ISO with ${iso_cmd}..."
+    
+    # Create ISO with cloud-init data
+    ${iso_cmd} -output "${cloud_init_iso}" \
+        -volid cidata \
+        -joliet \
+        -rock \
+        "${cloud_init_dir}/user-data" \
+        "${cloud_init_dir}/meta-data" \
+        "${cloud_init_dir}/network-config"
+    
+    print_info "Cloud-init ISO created: ${cloud_init_iso}"
+    print_info "ISO size: $(du -h "${cloud_init_iso}" | cut -f1)"
+}
+
 main() {
     print_header "Firecracker VM Setup"
     
@@ -598,6 +805,8 @@ main() {
     create_ubuntu_rootfs
     setup_networking
     create_vm_config
+    create_cloud_init_config
+    create_cloud_init_iso
     start_firecracker
     
     sleep 5  # Give the VM time to boot
