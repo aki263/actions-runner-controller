@@ -14,6 +14,7 @@ COPY go.mod go.sum ./
 # Also, we need to do this before setting TARGETPLATFORM/TARGETOS/TARGETARCH/TARGETVARIANT
 # so that go mod cache is shared across platforms.
 RUN go mod download
+RUN go mod tidy
 
 # Copy the go source
 # COPY . .
