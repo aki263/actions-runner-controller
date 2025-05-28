@@ -15,6 +15,7 @@ VM_IP="172.20.0.2"
 HOST_IP="172.20.0.1"
 ROOTFS_SIZE="10G"
 SSH_KEY_PATH="${WORK_DIR}/vm_key"
+CUSTOM_KERNEL=""
 
 # Colors for output
 RED='\033[0;31m'
@@ -81,10 +82,26 @@ setup_workspace() {
 }
 
 download_kernel() {
-    print_header "Downloading Kernel"
+    print_header "Setting Up Kernel"
     
     local kernel_file="vmlinux-${KERNEL_VERSION}"
     
+    # If custom kernel is specified, use it
+    if [ -n "${CUSTOM_KERNEL}" ]; then
+        if [ ! -f "${CUSTOM_KERNEL}" ]; then
+            print_error "Custom kernel file not found: ${CUSTOM_KERNEL}"
+            exit 1
+        fi
+        
+        print_info "Using custom kernel: ${CUSTOM_KERNEL}"
+        
+        # Copy custom kernel to work directory with expected name
+        cp "${CUSTOM_KERNEL}" "${kernel_file}"
+        print_info "Custom kernel copied to: ${kernel_file}"
+        return 0
+    fi
+    
+    # Download kernel if not using custom one
     if [ ! -f "${kernel_file}" ]; then
         print_info "Downloading Firecracker kernel ${KERNEL_VERSION}..."
         
@@ -442,6 +459,10 @@ main() {
                 ROOTFS_SIZE="$2"
                 shift 2
                 ;;
+            --custom-kernel|-k)
+                CUSTOM_KERNEL="$2"
+                shift 2
+                ;;
             --resize-only)
                 increase_rootfs_size "$2"
                 exit 0
@@ -452,6 +473,7 @@ main() {
                 echo "  --memory, -m <size>     VM memory in MB (default: 1024)"
                 echo "  --cpus, -c <count>      Number of CPUs (default: 2)"
                 echo "  --rootfs-size, -s <size> Root filesystem size (default: 10G)"
+                echo "  --custom-kernel, -k <path> Use custom kernel instead of downloading"
                 echo "  --resize-only <size>    Only resize existing rootfs"
                 echo "  --help, -h              Show this help"
                 exit 0
