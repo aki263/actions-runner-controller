@@ -390,3 +390,72 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - [Firecracker Kernel Setup](https://github.com/firecracker-microvm/firecracker/blob/main/docs/rootfs-and-kernel-setup.md)
 - [Ubuntu Cloud Images](https://cloud-images.ubuntu.com/)
 - [Felipe Cruz's Blog Post](https://www.felipecruz.es/exploring-firecracker-microvms-for-multi-tenant-dagger-ci-cd-pipelines/)
+
+## Networking Configuration
+
+The scripts now follow the [official Firecracker networking guide](https://raw.githubusercontent.com/firecracker-microvm/firecracker/refs/heads/main/docs/getting-started.md) for optimal compatibility:
+
+### Network Settings
+- **Host IP**: `172.16.0.1/30`
+- **VM IP**: `172.16.0.2`
+- **Interface**: `net1` (host) → `eth0` (guest)
+- **MAC Address**: `06:00:AC:10:00:02`
+
+### Post-Boot Network Setup
+The VM automatically configures:
+- Default route via the host gateway
+- DNS resolution (8.8.8.8, 8.8.4.4)
+- Internet connectivity through NAT
+
+### Troubleshooting Networking
+Use the enhanced debugging script:
+```bash
+./debug-networking.sh
+```
+
+This will check:
+- TAP device configuration
+- IP forwarding status
+- iptables rules
+- VM connectivity
+- Provide troubleshooting suggestions
+
+## Cloud-Init Support
+
+### Using Custom Cloud-Init YAML
+
+You can provide your own cloud-init configuration:
+
+1. **Create your YAML file** (e.g., `my-config.yaml`):
+```yaml
+#cloud-config
+hostname: my-firecracker-vm
+users:
+  - name: ubuntu
+    ssh_authorized_keys:
+      - ssh-rsa AAAAB3NzaC1yc2E... # Your SSH public key
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+packages:
+  - htop
+  - curl
+  - docker.io
+runcmd:
+  - systemctl enable docker
+  - systemctl start docker
+```
+
+2. **Apply the configuration**:
+```bash
+./custom-cloud-init.sh my-config.yaml
+```
+
+3. **Restart your VM** to apply the new configuration.
+
+### Default Cloud-Init Features
+The built-in cloud-init configuration includes:
+- SSH key setup for root and ubuntu users
+- Network configuration with internet access
+- Essential packages (htop, curl, vim, etc.)
+- Automatic network route and DNS setup
+- Debug scripts for troubleshooting

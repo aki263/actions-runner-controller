@@ -11,8 +11,10 @@ VM_CPUS="2"
 VM_ID="$(uuidgen | tr '[:upper:]' '[:lower:]' | tr -d '-' | head -c 8)"
 SOCKET_PATH="${WORK_DIR}/firecracker-${VM_ID}.socket"
 TAP_DEVICE="tap-${VM_ID}"
-VM_IP="172.20.0.2"
-HOST_IP="172.20.0.1"
+VM_IP="172.16.0.2"
+HOST_IP="172.16.0.1"
+MASK_SHORT="/30"
+FC_MAC="06:00:AC:10:00:02"
 ROOTFS_SIZE="10G"
 SSH_KEY_PATH="${WORK_DIR}/vm_key"
 CUSTOM_KERNEL=""
@@ -40,6 +42,38 @@ print_warning() {
 
 print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
+}
+
+check_os() {
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        print_error "This script requires Ubuntu 24.04 or compatible Linux distribution with KVM support."
+        print_error "macOS is not supported as Firecracker requires Linux KVM."
+        print_info ""
+        print_info "Options for macOS users:"
+        print_info "1. Use a Linux VM (VMware Fusion, Parallels, VirtualBox)"
+        print_info "2. Use Docker Desktop with Linux containers"
+        print_info "3. Use a cloud Linux instance (AWS EC2, Google Cloud, etc.)"
+        print_info "4. Use the provided Docker setup: ./macos-docker-setup.sh"
+        print_info ""
+        print_info "For Docker option, run: ./macos-docker-setup.sh"
+        exit 1
+    fi
+    
+    if [[ "$(uname -s)" != "Linux" ]]; then
+        print_error "This script requires Ubuntu 24.04 or compatible Linux distribution."
+        print_error "Detected OS: $(uname -s)"
+        exit 1
+    fi
+    
+    # Check if running on Ubuntu (optional warning)
+    if command -v lsb_release &> /dev/null; then
+        local distro
+        distro=$(lsb_release -si 2>/dev/null)
+        if [[ "$distro" != "Ubuntu" ]]; then
+            print_warning "This script is designed for Ubuntu 24.04. Detected: $distro"
+            print_warning "Some commands may need adjustment for your distribution."
+        fi
+    fi
 }
 
 check_dependencies() {
@@ -157,10 +191,14 @@ create_ubuntu_rootfs() {
 Name=eth0
 
 [Network]
-Address=${VM_IP}/24
+Address=${VM_IP}/30
 Gateway=${HOST_IP}
 DNS=8.8.8.8
 DNS=8.8.4.4
+
+[Route]
+Destination=0.0.0.0/0
+Gateway=${HOST_IP}
 EOF
         
         # Enable systemd-networkd and disable NetworkManager
@@ -288,49 +326,50 @@ EOF
 setup_networking() {
     print_header "Setting Up Networking"
     
-    # Check if tap device already exists
-    if ip link show "${TAP_DEVICE}" &> /dev/null; then
-        print_info "TAP device ${TAP_DEVICE} already exists"
-        return
-    fi
+    # Remove existing TAP device if it exists
+    sudo ip link del "${TAP_DEVICE}" 2> /dev/null || true
     
     print_info "Creating TAP device: ${TAP_DEVICE}"
     
-    # Create TAP device
-    sudo ip tuntap add dev "${TAP_DEVICE}" mode tap user "$(whoami)"
-    
-    # Configure TAP device
-    sudo ip addr add "${HOST_IP}/24" dev "${TAP_DEVICE}"
+    # Create TAP device (following official guide)
+    sudo ip tuntap add dev "${TAP_DEVICE}" mode tap
+    sudo ip addr add "${HOST_IP}${MASK_SHORT}" dev "${TAP_DEVICE}"
     sudo ip link set dev "${TAP_DEVICE}" up
     
     # Enable IP forwarding
-    echo 1 | sudo tee /proc/sys/net/ipv4/ip_forward > /dev/null
+    sudo sh -c "echo 1 > /proc/sys/net/ipv4/ip_forward"
     
     # Make IP forwarding persistent
     echo 'net.ipv4.ip_forward=1' | sudo tee -a /etc/sysctl.conf > /dev/null || true
     
-    # Set up iptables rules for NAT (more comprehensive)
-    print_info "Setting up iptables rules for NAT..."
+    # Set up iptables rules (following official guide)
+    print_info "Setting up iptables rules for internet access..."
     
-    # Allow traffic from VM to internet
-    sudo iptables -t nat -A POSTROUTING -s "${VM_IP}/32" -j MASQUERADE
+    # Accept forwarding
+    sudo iptables -P FORWARD ACCEPT
     
-    # Allow established and related connections
-    sudo iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    # Determine host network interface for internet access
+    local host_iface
+    host_iface=$(ip -j route list default | jq -r '.[0].dev' 2>/dev/null || ip route | grep default | awk '{print $5}' | head -1)
     
-    # Allow traffic from TAP device
-    sudo iptables -A FORWARD -i "${TAP_DEVICE}" -j ACCEPT
+    if [ -z "$host_iface" ]; then
+        print_warning "Could not determine host network interface. Using eth0 as fallback."
+        host_iface="eth0"
+    fi
     
-    # Allow traffic to TAP device
-    sudo iptables -A FORWARD -o "${TAP_DEVICE}" -j ACCEPT
+    print_info "Using host interface: ${host_iface}"
     
-    # Allow SSH traffic to VM
-    sudo iptables -A INPUT -i "${TAP_DEVICE}" -p tcp --dport 22 -j ACCEPT
+    # Remove existing MASQUERADE rule if it exists
+    sudo iptables -t nat -D POSTROUTING -o "$host_iface" -j MASQUERADE 2>/dev/null || true
+    
+    # Add MASQUERADE rule for internet access
+    sudo iptables -t nat -A POSTROUTING -o "$host_iface" -j MASQUERADE
     
     print_info "Networking configured"
-    print_info "Host IP: ${HOST_IP}"
+    print_info "Host IP: ${HOST_IP}${MASK_SHORT}"
     print_info "VM IP: ${VM_IP}"
     print_info "TAP device: ${TAP_DEVICE}"
+    print_info "Host interface: ${host_iface}"
 }
 
 create_vm_config() {
@@ -360,8 +399,8 @@ create_vm_config() {
   ],
   "network-interfaces": [
     {
-      "iface_id": "eth0",
-      "guest_mac": "AA:FC:00:00:00:01",
+      "iface_id": "net1",
+      "guest_mac": "${FC_MAC}",
       "host_dev_name": "${TAP_DEVICE}"
     }
   ],
@@ -446,11 +485,11 @@ start_firecracker() {
         -H "Accept: application/json" \
         -H "Content-Type: application/json" \
         -d "{
-            \"iface_id\": \"eth0\",
-            \"guest_mac\": \"AA:FC:00:00:00:01\",
+            \"iface_id\": \"net1\",
+            \"guest_mac\": \"${FC_MAC}\",
             \"host_dev_name\": \"${TAP_DEVICE}\"
         }" \
-        http://localhost/network-interfaces/eth0 > /dev/null
+        http://localhost/network-interfaces/net1 > /dev/null
     
     # Start the VM
     print_info "Booting the VM..."
@@ -471,7 +510,7 @@ start_firecracker() {
 wait_for_ssh() {
     print_header "Waiting for SSH to be Ready"
     
-    local max_attempts=60
+    local max_attempts=3
     local attempt=1
     
     print_info "Testing network connectivity first..."
@@ -632,8 +671,10 @@ network:
   ethernets:
     eth0:
       addresses:
-        - ${VM_IP}/24
-      gateway4: ${HOST_IP}
+        - ${VM_IP}/30
+      routes:
+        - to: default
+          via: ${HOST_IP}
       nameservers:
         addresses:
           - 8.8.8.8
@@ -684,6 +725,25 @@ write_files:
       ping -c 3 8.8.8.8 || echo "  DNS ping failed"
       echo "================================="
 
+  - path: /root/setup-network.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      # Post-boot network setup as per Firecracker official guide
+      echo "Setting up network routes and DNS..."
+      
+      # Add default route (as per official guide)
+      ip route add default via ${HOST_IP} dev eth0 2>/dev/null || echo "Default route already exists"
+      
+      # Setup DNS resolution (as per official guide)
+      echo 'nameserver 8.8.8.8' > /etc/resolv.conf
+      echo 'nameserver 8.8.4.4' >> /etc/resolv.conf
+      
+      # Test connectivity
+      echo "Testing connectivity:"
+      ping -c 2 ${HOST_IP} && echo "Gateway reachable" || echo "Gateway unreachable"
+      ping -c 2 8.8.8.8 && echo "Internet reachable" || echo "Internet unreachable"
+
 # Run commands
 runcmd:
   - systemctl enable ssh
@@ -691,6 +751,7 @@ runcmd:
   - systemctl enable systemd-networkd
   - systemctl start systemd-networkd
   - echo '/root/welcome.sh' >> /root/.bashrc
+  - /root/setup-network.sh
 
 # Final message
 final_message: "Firecracker VM is ready! SSH: ssh -i /path/to/vm_key root@${VM_IP}"
@@ -708,8 +769,11 @@ version: 2
 ethernets:
   eth0:
     addresses:
-      - ${VM_IP}/24
+      - ${VM_IP}/30
     gateway4: ${HOST_IP}
+    routes:
+      - to: default
+        via: ${HOST_IP}
     nameservers:
       addresses:
         - 8.8.8.8
@@ -799,6 +863,7 @@ main() {
         esac
     done
     
+    check_os
     check_dependencies
     setup_workspace
     download_kernel
