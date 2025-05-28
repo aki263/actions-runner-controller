@@ -5,7 +5,7 @@ set -euo pipefail
 # Configuration variables
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK_DIR="${SCRIPT_DIR}/firecracker-vm"
-KERNEL_VERSION="5.10"
+KERNEL_VERSION="6.1.128"
 VM_MEMORY="1024"
 VM_CPUS="2"
 VM_ID="$(uuidgen | tr '[:upper:]' '[:lower:]' | tr -d '-' | head -c 8)"
@@ -87,8 +87,29 @@ download_kernel() {
     
     if [ ! -f "${kernel_file}" ]; then
         print_info "Downloading Firecracker kernel ${KERNEL_VERSION}..."
-        curl -fsSL -o "${kernel_file}" \
-            "https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/kernels/vmlinux.bin"
+        
+        # Download the appropriate kernel based on version
+        case "${KERNEL_VERSION}" in
+            "6.1.128")
+                curl -fsSL -o "${kernel_file}" \
+                    "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/x86_64/vmlinux-6.1.128"
+                ;;
+            "6.1.55"|"6.1")
+                curl -fsSL -o "${kernel_file}" \
+                    "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.7/x86_64/vmlinux-6.1.55"
+                ;;
+            "5.10")
+                curl -fsSL -o "${kernel_file}" \
+                    "https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/kernels/vmlinux.bin"
+                ;;
+            *)
+                print_error "Unsupported kernel version: ${KERNEL_VERSION}"
+                print_info "Supported versions: 5.10, 6.1.55, 6.1.128"
+                print_info "You can also manually place a kernel file at ${kernel_file}"
+                exit 1
+                ;;
+        esac
+        
         print_info "Kernel downloaded: ${kernel_file}"
     else
         print_info "Kernel already exists: ${kernel_file}"
@@ -287,33 +308,51 @@ start_firecracker() {
     
     print_info "Configuring VM via API..."
     
-    # Configure the VM
+    # Configure machine settings
     curl -X PUT \
         --unix-socket "${SOCKET_PATH}" \
         -H "Accept: application/json" \
         -H "Content-Type: application/json" \
-        -d "@${config_file}" \
+        -d "{
+            \"vcpu_count\": ${VM_CPUS},
+            \"mem_size_mib\": ${VM_MEMORY}
+        }" \
         http://localhost/machine-config > /dev/null
     
+    # Configure boot source
     curl -X PUT \
         --unix-socket "${SOCKET_PATH}" \
         -H "Accept: application/json" \
         -H "Content-Type: application/json" \
-        -d "@${config_file}" \
+        -d "{
+            \"kernel_image_path\": \"${WORK_DIR}/vmlinux-${KERNEL_VERSION}\",
+            \"boot_args\": \"console=ttyS0 reboot=k panic=1 pci=off nomodules rw ip=${VM_IP}::${HOST_IP}:255.255.255.0::eth0:off\"
+        }" \
         http://localhost/boot-source > /dev/null
     
+    # Configure rootfs drive
     curl -X PUT \
         --unix-socket "${SOCKET_PATH}" \
         -H "Accept: application/json" \
         -H "Content-Type: application/json" \
-        -d "@${config_file}" \
+        -d "{
+            \"drive_id\": \"rootfs\",
+            \"path_on_host\": \"${WORK_DIR}/ubuntu-24.04-rootfs.ext4\",
+            \"is_root_device\": true,
+            \"is_read_only\": false
+        }" \
         http://localhost/drives/rootfs > /dev/null
     
+    # Configure network interface
     curl -X PUT \
         --unix-socket "${SOCKET_PATH}" \
         -H "Accept: application/json" \
         -H "Content-Type: application/json" \
-        -d "@${config_file}" \
+        -d "{
+            \"iface_id\": \"eth0\",
+            \"guest_mac\": \"AA:FC:00:00:00:01\",
+            \"host_dev_name\": \"${TAP_DEVICE}\"
+        }" \
         http://localhost/network-interfaces/eth0 > /dev/null
     
     # Start the VM

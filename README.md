@@ -215,7 +215,7 @@ After running the setup script:
 
 ```
 firecracker-vm/
-├── vmlinux-5.10                    # Kernel binary
+├── vmlinux-6.1.128                 # Kernel binary
 ├── ubuntu-24.04-rootfs.ext4        # Root filesystem
 ├── vm_key                          # SSH private key
 ├── vm_key.pub                      # SSH public key
@@ -309,7 +309,7 @@ To use a custom kernel, replace the downloaded kernel file:
 
 ```bash
 # Place your kernel binary
-cp /path/to/your/vmlinux ./firecracker-vm/vmlinux-5.10
+cp /path/to/your/vmlinux ./firecracker-vm/vmlinux-6.1.128
 ```
 
 ### Custom Rootfs Modifications
