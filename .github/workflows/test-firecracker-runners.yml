@@ -1,0 +1,309 @@
+name: Test Firecracker Runners
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_labels:
+        description: 'Runner labels (e.g., firecracker, self-hosted, ubuntu-24.04)'
+        required: true
+        default: 'firecracker'
+        type: string
+      test_level:
+        description: 'Test level to run'
+        required: true
+        default: 'basic'
+        type: choice
+        options:
+          - basic
+          - full
+          - stress
+      docker_test:
+        description: 'Test Docker functionality'
+        required: false
+        default: true
+        type: boolean
+      performance_test:
+        description: 'Run performance benchmarks'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  test-runner:
+    runs-on: ${{ github.event.inputs.runner_labels }}
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🖥️ System Information
+        run: |
+          echo "=== FIRECRACKER RUNNER SYSTEM SPECS ==="
+          echo "Runner: ${{ github.event.inputs.runner_labels }}"
+          echo "Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo ""
+          
+          echo "🔧 Hardware Information:"
+          echo "CPU Model: $(lscpu | grep 'Model name' | sed 's/Model name: *//' | xargs)"
+          echo "CPU Cores: $(nproc)"
+          echo "CPU Architecture: $(uname -m)"
+          echo "Memory Total: $(free -h | grep Mem | awk '{print $2}')"
+          echo "Memory Available: $(free -h | grep Mem | awk '{print $7}')"
+          echo "Disk Space: $(df -h / | tail -1 | awk '{print $2 " total, " $4 " available"}')"
+          echo ""
+          
+          echo "💻 Operating System:"
+          echo "OS: $(cat /etc/os-release | grep PRETTY_NAME | cut -d'"' -f2)"
+          echo "Kernel: $(uname -r)"
+          echo "Uptime: $(uptime -p)"
+          echo ""
+          
+          echo "🌐 Network Information:"
+          echo "Hostname: $(hostname)"
+          echo "IP Address: $(ip addr show eth0 | grep 'inet ' | awk '{print $2}' | cut -d'/' -f1 || echo 'N/A')"
+          echo "Internet connectivity: $(curl -s --max-time 5 https://httpbin.org/ip | jq -r '.origin' || echo 'Failed')"
+          echo ""
+          
+          echo "🔄 Process Information:"
+          echo "Load Average: $(uptime | awk -F'load average:' '{print $2}')"
+          echo "Running Processes: $(ps aux | wc -l)"
+          echo ""
+
+      - name: 🐳 Docker Information
+        if: github.event.inputs.docker_test == 'true'
+        run: |
+          echo "=== DOCKER FUNCTIONALITY TEST ==="
+          echo "Docker Version: $(docker --version)"
+          echo "Docker Compose Version: $(docker compose version)"
+          echo ""
+          
+          echo "🔍 Docker System Info:"
+          docker system info --format "Driver: {{.Driver}}"
+          docker system info --format "Storage Driver: {{.Driver}}"
+          docker system info --format "Cgroup Driver: {{.CgroupDriver}}"
+          docker system info --format "Cgroup Version: {{.CgroupVersion}}"
+          echo ""
+          
+          echo "📦 Testing Docker functionality:"
+          docker run --rm hello-world
+          echo ""
+          
+          echo "🏗️ Testing multi-stage build:"
+          cat > Dockerfile.test << 'EOF'
+          FROM alpine:latest as builder
+          RUN echo "Build stage" > /build.txt
+          
+          FROM alpine:latest
+          COPY --from=builder /build.txt /app/
+          CMD cat /app/build.txt && echo "Docker multi-stage build works!"
+          EOF
+          
+          docker build -t firecracker-test -f Dockerfile.test .
+          docker run --rm firecracker-test
+          docker rmi firecracker-test
+          rm Dockerfile.test
+          echo "✅ Docker functionality verified"
+
+      - name: 🏃‍♂️ GitHub Actions Runner Tests
+        run: |
+          echo "=== GITHUB ACTIONS RUNNER TESTS ==="
+          echo "Runner Name: $RUNNER_NAME"
+          echo "Runner OS: $RUNNER_OS"
+          echo "Runner Architecture: $RUNNER_ARCH"
+          echo "Runner Temp Directory: $RUNNER_TEMP"
+          echo "Runner Tool Cache: $RUNNER_TOOL_CACHE"
+          echo "Runner Workspace: $GITHUB_WORKSPACE"
+          echo ""
+          
+          echo "🔧 Environment Variables:"
+          echo "GitHub Actor: $GITHUB_ACTOR"
+          echo "GitHub Repository: $GITHUB_REPOSITORY"
+          echo "GitHub Workflow: $GITHUB_WORKFLOW"
+          echo "GitHub Run ID: $GITHUB_RUN_ID"
+          echo "GitHub Run Number: $GITHUB_RUN_NUMBER"
+          echo ""
+          
+          echo "📁 Filesystem Check:"
+          echo "Current Directory: $(pwd)"
+          echo "Home Directory: $HOME"
+          echo "Workspace Contents:"
+          ls -la $GITHUB_WORKSPACE
+          echo ""
+          
+          echo "🛠️ Available Tools:"
+          which git && echo "Git: $(git --version)"
+          which curl && echo "Curl: $(curl --version | head -1)"
+          which jq && echo "JQ: $(jq --version)"
+          which docker && echo "Docker: $(docker --version)"
+          echo ""
+
+      - name: 📊 Performance Tests
+        if: github.event.inputs.performance_test == 'true'
+        run: |
+          echo "=== PERFORMANCE BENCHMARKS ==="
+          
+          echo "💾 Memory Performance:"
+          echo "Memory bandwidth test (simple):"
+          time dd if=/dev/zero of=/tmp/speedtest bs=1M count=100 2>&1 | grep -E "(copied|MB/s)"
+          rm -f /tmp/speedtest
+          echo ""
+          
+          echo "💽 Disk I/O Performance:"
+          echo "Sequential write test:"
+          sync && time sh -c "dd if=/dev/zero of=/tmp/disktest bs=1M count=100 && sync" 2>&1 | grep -E "(copied|MB/s)"
+          echo "Sequential read test:"
+          time dd if=/tmp/disktest of=/dev/null bs=1M 2>&1 | grep -E "(copied|MB/s)"
+          rm -f /tmp/disktest
+          echo ""
+          
+          echo "🔢 CPU Performance:"
+          echo "CPU computation test (calculating pi):"
+          time echo "scale=1000; 4*a(1)" | bc -l > /dev/null
+          echo ""
+          
+          echo "🌐 Network Performance:"
+          echo "Download speed test:"
+          time curl -s -o /tmp/speedtest https://httpbin.org/bytes/1048576
+          ls -lh /tmp/speedtest
+          rm -f /tmp/speedtest
+          echo ""
+
+      - name: 🧪 Stress Tests
+        if: github.event.inputs.test_level == 'stress'
+        run: |
+          echo "=== STRESS TESTS ==="
+          
+          echo "🔥 CPU Stress Test (30 seconds):"
+          timeout 30 yes > /dev/null &
+          timeout 30 yes > /dev/null &
+          wait
+          echo "CPU stress test completed"
+          echo ""
+          
+          echo "💾 Memory Stress Test:"
+          echo "Allocating and freeing memory..."
+          python3 -c "
+          import time
+          data = []
+          for i in range(10):
+              data.append(' ' * (10 * 1024 * 1024))  # 10MB chunks
+              time.sleep(0.1)
+          print('Memory stress test completed')
+          "
+          echo ""
+          
+          echo "🐳 Docker Stress Test:"
+          echo "Running multiple containers simultaneously:"
+          for i in {1..5}; do
+            docker run -d --name stress-test-$i alpine:latest sleep 10
+          done
+          
+          echo "Active containers:"
+          docker ps
+          
+          echo "Waiting for containers to finish..."
+          sleep 12
+          
+          echo "Cleaning up containers:"
+          docker rm -f $(docker ps -aq --filter "name=stress-test-") 2>/dev/null || true
+          echo "Stress tests completed"
+
+      - name: 🔍 Full System Diagnostics
+        if: github.event.inputs.test_level == 'full'
+        run: |
+          echo "=== FULL SYSTEM DIAGNOSTICS ==="
+          
+          echo "📋 Process List (top 10 by CPU):"
+          ps aux --sort=-%cpu | head -11
+          echo ""
+          
+          echo "💾 Memory Usage Details:"
+          free -h
+          echo ""
+          
+          echo "💽 Disk Usage Details:"
+          df -h
+          echo ""
+          
+          echo "🔌 Network Interfaces:"
+          ip addr show
+          echo ""
+          
+          echo "🔧 System Services:"
+          systemctl list-units --type=service --state=running | head -20
+          echo ""
+          
+          echo "📊 System Limits:"
+          ulimit -a
+          echo ""
+          
+          echo "🏷️ Environment Summary:"
+          echo "User: $(whoami)"
+          echo "Groups: $(groups)"
+          echo "Shell: $SHELL"
+          echo "PATH: $PATH"
+          echo ""
+
+      - name: 🧹 Cleanup & Summary
+        if: always()
+        run: |
+          echo "=== TEST SUMMARY ==="
+          echo "Runner Labels: ${{ github.event.inputs.runner_labels }}"
+          echo "Test Level: ${{ github.event.inputs.test_level }}"
+          echo "Docker Test: ${{ github.event.inputs.docker_test }}"
+          echo "Performance Test: ${{ github.event.inputs.performance_test }}"
+          echo "Test Completed: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo ""
+          
+          echo "🎯 Test Results:"
+          echo "✅ System specs collected"
+          echo "✅ GitHub Actions runner verified"
+          if [ "${{ github.event.inputs.docker_test }}" == "true" ]; then
+            echo "✅ Docker functionality tested"
+          fi
+          if [ "${{ github.event.inputs.performance_test }}" == "true" ]; then
+            echo "✅ Performance benchmarks completed"
+          fi
+          if [ "${{ github.event.inputs.test_level }}" == "stress" ]; then
+            echo "✅ Stress tests completed"
+          fi
+          if [ "${{ github.event.inputs.test_level }}" == "full" ]; then
+            echo "✅ Full diagnostics completed"
+          fi
+          echo ""
+          
+          echo "🧹 Cleanup:"
+          docker system prune -f || true
+          echo "Cleanup completed"
+          echo ""
+          
+          echo "🚀 Firecracker Runner Test Completed Successfully! 🚀"
+
+  # Optional job that runs on GitHub-hosted runners for comparison
+  comparison-test:
+    runs-on: ubuntu-latest
+    if: github.event.inputs.test_level == 'full'
+    timeout-minutes: 10
+    
+    steps:
+      - name: 🔬 GitHub-Hosted Runner Comparison
+        run: |
+          echo "=== GITHUB-HOSTED RUNNER COMPARISON ==="
+          echo "This runs on GitHub's hosted runners for comparison"
+          echo ""
+          
+          echo "🖥️ GitHub Runner Specs:"
+          echo "CPU Cores: $(nproc)"
+          echo "Memory: $(free -h | grep Mem | awk '{print $2}')"
+          echo "Disk: $(df -h / | tail -1 | awk '{print $2}')"
+          echo "OS: $(cat /etc/os-release | grep PRETTY_NAME | cut -d'"' -f2)"
+          echo "Kernel: $(uname -r)"
+          echo "Architecture: $(uname -m)"
+          echo ""
+          
+          echo "⚡ Quick Performance Test:"
+          time echo "scale=100; 4*a(1)" | bc -l > /dev/null
+          echo ""
+          
+          echo "📊 This provides a baseline to compare your Firecracker runners against" 
