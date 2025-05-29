@@ -109,7 +109,7 @@ done
 ## Features
 
 - ✅ **Fast deployment**: Boot VMs from snapshots in ~30 seconds
-- ✅ **GitHub Actions runner**: Pre-installed with Docker support
+- ✅ **GitHub Actions runner**: Pre-installed with Docker CE support
 - ✅ **Cloud-init**: Dynamic configuration (hostname, SSH keys, environment)
 - ✅ **Isolation**: Each runner in separate Firecracker microVM
 - ✅ **Networking**: Full internet access via TAP/NAT
@@ -131,6 +131,14 @@ done
 - **Boot time**: ~30 seconds from snapshot
 - **VM resources**: 2GB RAM, 2 CPU (configurable)
 - **Disk usage**: ~3-5GB per image/snapshot
+
+## Technical Details
+
+- **Docker Installation**: Uses official Docker CE repository (latest stable)
+- **GitHub Actions Runner**: Latest version from GitHub releases
+- **Ubuntu Base**: 24.04 LTS with cloud-init support
+- **Kernel**: Firecracker-optimized kernel from official releases
+- **Networking**: TAP devices with NAT for internet access
 
 ---
 

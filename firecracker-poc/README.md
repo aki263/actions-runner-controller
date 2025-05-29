@@ -68,7 +68,7 @@ firecracker-poc/
 ## Features
 
 - ✅ **Fast deployment**: Boot from snapshots in ~30 seconds
-- ✅ **GitHub Actions runner**: Pre-installed with Docker
+- ✅ **GitHub Actions runner**: Pre-installed with Docker CE
 - ✅ **Isolation**: Firecracker microVMs for security
 - ✅ **Cloud-init**: Dynamic configuration
 - ✅ **Networking**: Full internet access

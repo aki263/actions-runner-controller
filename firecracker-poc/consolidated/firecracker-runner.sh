@@ -11,8 +11,8 @@ WORK_DIR="${SCRIPT_DIR}/firecracker-data"
 VERSION="1.0.0"
 
 # Default configuration
-RUNNER_VERSION="2.311.0"
-DOCKER_VERSION="24.0.7"
+RUNNER_VERSION="2.324.0"
+DOCKER_VERSION="latest"
 ROOTFS_SIZE="20G"
 VM_MEMORY="2048"
 VM_CPUS="2"
@@ -130,7 +130,7 @@ build_image() {
     print_info "Installing Ubuntu 24.04 with runner dependencies..."
     
     # Install base system with all needed packages
-    sudo debootstrap --include=openssh-server,curl,wget,vim,htop,systemd,init,sudo,ca-certificates,cloud-init,jq,unzip,zip,git,iptables,docker.io \
+    sudo debootstrap --include=openssh-server,curl,wget,vim,htop,systemd,init,sudo,ca-certificates,cloud-init,jq,unzip,zip,git,iptables \
         noble "${mount_dir}" http://archive.ubuntu.com/ubuntu/
     
     # Configure runner environment
@@ -138,8 +138,26 @@ build_image() {
     
     # Create runner user
     sudo chroot "${mount_dir}" useradd -m -s /bin/bash runner
-    sudo chroot "${mount_dir}" usermod -aG sudo,docker runner
+    sudo chroot "${mount_dir}" usermod -aG sudo runner
     echo "runner ALL=(ALL) NOPASSWD:ALL" | sudo tee "${mount_dir}/etc/sudoers.d/runner" > /dev/null
+    
+    # Install Docker CE (official Docker repository)
+    print_info "Installing Docker CE from official repository..."
+    
+    # Add Docker's official GPG key
+    sudo chroot "${mount_dir}" install -m 0755 -d /etc/apt/keyrings
+    sudo chroot "${mount_dir}" curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    sudo chroot "${mount_dir}" chmod a+r /etc/apt/keyrings/docker.asc
+    
+    # Add the repository to Apt sources
+    sudo chroot "${mount_dir}" bash -c 'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null'
+    
+    # Update package list and install Docker
+    sudo chroot "${mount_dir}" apt-get update
+    sudo chroot "${mount_dir}" apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    
+    # Add runner user to docker group
+    sudo chroot "${mount_dir}" usermod -aG docker runner
     
     # Download and install runner
     local runner_arch="x64"
