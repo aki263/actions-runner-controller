@@ -140,6 +140,38 @@ done
 - **Kernel**: Firecracker-optimized kernel from official releases
 - **Networking**: TAP devices with NAT for internet access
 
+## Testing Your Runners
+
+After deploying runners, test them with the included GitHub workflows:
+
+### 1. Test Firecracker Runners Workflow
+- **Location**: `.github/workflows/test-firecracker-runners.yml`
+- **Purpose**: Comprehensive runner testing with system specs, Docker tests, and performance benchmarks
+- **Usage**: GitHub Actions → "Test Firecracker Runners" → Run workflow
+- **Configure**: Runner labels (e.g., `firecracker`), test level, enable Docker/performance tests
+
+### 2. Deploy and Test Runner Workflow  
+- **Location**: `.github/workflows/deploy-test-runner.yml`
+- **Purpose**: Deployment guidance and connection verification
+- **Usage**: GitHub Actions → "Deploy and Test Firecracker Runner" → Run workflow
+- **Configure**: Runner name, memory, CPUs, auto-test option
+
+**Example workflow usage**:
+```bash
+# 1. Deploy runner
+./firecracker-runner.sh launch \
+  --name "test-runner" \
+  --github-url "https://github.com/your-org/repo" \
+  --github-token "$GITHUB_TOKEN" \
+  --labels "firecracker,test"
+
+# 2. Go to GitHub Actions → "Test Firecracker Runners"
+# 3. Set runner labels to: "firecracker,test"
+# 4. Run workflow and see detailed specs!
+```
+
+See [`.github/workflows/README.md`](../.github/workflows/README.md) for detailed testing instructions.
+
 ---
 
 **This replaces all the separate scripts with one unified tool.** 🚀 

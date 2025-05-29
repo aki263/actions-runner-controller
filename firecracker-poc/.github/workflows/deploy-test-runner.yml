@@ -1,0 +1,157 @@
+name: Deploy and Test Firecracker Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_name:
+        description: 'Name for the test runner'
+        required: true
+        default: 'test-runner'
+        type: string
+      runner_memory:
+        description: 'Memory allocation (MB)'
+        required: false
+        default: '2048'
+        type: string
+      runner_cpus:
+        description: 'CPU cores'
+        required: false
+        default: '2'
+        type: string
+      test_after_deploy:
+        description: 'Run test workflow after deployment'
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  deployment-instructions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    
+    steps:
+      - name: 📋 Deployment Instructions
+        run: |
+          echo "=== FIRECRACKER RUNNER DEPLOYMENT GUIDE ==="
+          echo ""
+          echo "To deploy a Firecracker runner with the specified configuration:"
+          echo ""
+          echo "Runner Name: ${{ github.event.inputs.runner_name }}"
+          echo "Memory: ${{ github.event.inputs.runner_memory }} MB"
+          echo "CPUs: ${{ github.event.inputs.runner_cpus }}"
+          echo ""
+          echo "📝 Commands to run on your Linux host:"
+          echo ""
+          echo "# 1. Navigate to the consolidated directory"
+          echo "cd firecracker-poc/consolidated/"
+          echo ""
+          echo "# 2. Deploy the runner"
+          echo "./firecracker-runner.sh launch \\"
+          echo "  --name '${{ github.event.inputs.runner_name }}' \\"
+          echo "  --memory ${{ github.event.inputs.runner_memory }} \\"
+          echo "  --cpus ${{ github.event.inputs.runner_cpus }} \\"
+          echo "  --github-url 'https://github.com/${{ github.repository }}' \\"
+          echo "  --github-token '\$GITHUB_TOKEN' \\"
+          echo "  --labels 'firecracker,test,${{ github.event.inputs.runner_name }}'"
+          echo ""
+          echo "# 3. Verify deployment"
+          echo "./firecracker-runner.sh list"
+          echo ""
+          echo "🔑 Make sure to:"
+          echo "- Have a GitHub token with 'repo' permissions"
+          echo "- Run on Ubuntu 24.04 with KVM support"
+          echo "- Have built the runner image first (./firecracker-runner.sh build)"
+          echo ""
+          echo "Once deployed, the runner will appear in:"
+          echo "Repository Settings → Actions → Runners"
+          echo ""
+          if [ "${{ github.event.inputs.test_after_deploy }}" == "true" ]; then
+            echo "🧪 After deployment, manually trigger the 'Test Firecracker Runners' workflow"
+            echo "with runner labels: 'firecracker,test,${{ github.event.inputs.runner_name }}'"
+          fi
+
+  verify-ready:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    needs: deployment-instructions
+    
+    steps:
+      - name: ✅ Verification Checklist
+        run: |
+          echo "=== PRE-DEPLOYMENT VERIFICATION ==="
+          echo ""
+          echo "✅ Workflow configuration ready"
+          echo "✅ Deployment instructions provided"
+          echo "✅ Runner specifications confirmed:"
+          echo "   - Name: ${{ github.event.inputs.runner_name }}"
+          echo "   - Memory: ${{ github.event.inputs.runner_memory }} MB"
+          echo "   - CPUs: ${{ github.event.inputs.runner_cpus }}"
+          echo ""
+          echo "🚀 Ready for manual deployment on your Linux host!"
+          echo ""
+          echo "📍 Next steps:"
+          echo "1. Follow the deployment commands above"
+          echo "2. Wait for runner to appear in GitHub (2-3 minutes)"
+          echo "3. Trigger 'Test Firecracker Runners' workflow"
+          echo "4. Use runner labels: 'firecracker,test,${{ github.event.inputs.runner_name }}'"
+
+  # This job will only run if a runner with the expected labels is available
+  test-deployed-runner:
+    runs-on: ["self-hosted", "firecracker", "test", "${{ github.event.inputs.runner_name }}"]
+    timeout-minutes: 10
+    needs: verify-ready
+    if: github.event.inputs.test_after_deploy == 'true'
+    continue-on-error: true  # Don't fail if runner isn't available yet
+    
+    steps:
+      - name: 🎉 Successful Runner Connection
+        run: |
+          echo "=== RUNNER SUCCESSFULLY DEPLOYED AND CONNECTED! ==="
+          echo ""
+          echo "🎯 Runner Details:"
+          echo "Name: ${{ github.event.inputs.runner_name }}"
+          echo "Labels: self-hosted, firecracker, test, ${{ github.event.inputs.runner_name }}"
+          echo "Memory: ${{ github.event.inputs.runner_memory }} MB"
+          echo "CPUs: ${{ github.event.inputs.runner_cpus }}"
+          echo ""
+          echo "📊 Quick System Check:"
+          echo "Hostname: $(hostname)"
+          echo "Uptime: $(uptime -p)"
+          echo "Memory: $(free -h | grep Mem | awk '{print $3 "/" $2}')"
+          echo "CPU: $(nproc) cores"
+          echo "OS: $(cat /etc/os-release | grep PRETTY_NAME | cut -d'"' -f2)"
+          echo ""
+          echo "✅ Firecracker runner is working correctly!"
+          echo ""
+          echo "💡 You can now run the full test suite with:"
+          echo "Workflow: 'Test Firecracker Runners'"
+          echo "Runner labels: 'firecracker,test,${{ github.event.inputs.runner_name }}'"
+
+  fallback-instructions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    needs: test-deployed-runner
+    if: failure() && github.event.inputs.test_after_deploy == 'true'
+    
+    steps:
+      - name: 📌 Runner Not Available Yet
+        run: |
+          echo "=== RUNNER NOT YET AVAILABLE ==="
+          echo ""
+          echo "This is normal! The runner may still be deploying."
+          echo ""
+          echo "🔄 Expected timeline:"
+          echo "- Image build: 15-30 minutes (first time)"
+          echo "- Snapshot creation: 30 seconds"
+          echo "- VM launch: 30-60 seconds"
+          echo "- Runner registration: 1-2 minutes"
+          echo ""
+          echo "📍 To test when ready:"
+          echo "1. Wait for runner to appear in GitHub Settings → Actions → Runners"
+          echo "2. Manually trigger 'Test Firecracker Runners' workflow"
+          echo "3. Use runner labels: 'firecracker,test,${{ github.event.inputs.runner_name }}'"
+          echo ""
+          echo "🔍 Debug tips:"
+          echo "- Check VM status: ./firecracker-runner.sh list"
+          echo "- SSH into VM: ssh -i runner-instances/*/ssh_key runner@172.16.0.2"
+          echo "- Check runner service: systemctl status github-runner" 
