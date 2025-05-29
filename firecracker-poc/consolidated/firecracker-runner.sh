@@ -236,7 +236,7 @@ create_snapshot() {
         exit 1
     fi
     
-    local snapshot_dir="snapshots/${snapshot_name}"
+    local snapshot_dir="${WORK_DIR}/snapshots/${snapshot_name}"
     mkdir -p "$snapshot_dir"
     
     # Copy image
@@ -321,7 +321,7 @@ launch_vm() {
         snapshot_name=$(jq -r '.snapshots | sort_by(.created) | last | .name' "$registry")
     fi
     
-    local snapshot_dir="snapshots/${snapshot_name}"
+    local snapshot_dir="${WORK_DIR}/snapshots/${snapshot_name}"
     if [ ! -d "$snapshot_dir" ]; then
         print_error "Snapshot not found: $snapshot_name"
         exit 1
@@ -331,7 +331,7 @@ launch_vm() {
     
     # Setup instance
     local vm_id=$(echo "$runner_name" | tr '[:upper:]' '[:lower:]' | head -c 8)
-    local instance_dir="instances/${vm_id}"
+    local instance_dir="${WORK_DIR}/instances/${vm_id}"
     mkdir -p "$instance_dir"
     cd "$instance_dir"
     
@@ -490,7 +490,7 @@ list_resources() {
     # Running instances
     echo -e "${GREEN}Running Instances:${NC}"
     if [ -d "instances" ] && [ "$(ls -A instances 2>/dev/null)" ]; then
-        for inst in instances/*/info.json; do
+        for inst in "${WORK_DIR}"/instances/*/info.json; do
             if [ -f "$inst" ]; then
                 local name=$(jq -r '.name' "$inst")
                 local ip=$(jq -r '.ip' "$inst")
@@ -517,7 +517,7 @@ stop_instances() {
     fi
     
     local stopped=0
-    for inst in instances/*/info.json; do
+    for inst in "${WORK_DIR}"/instances/*/info.json; do
         if [ -f "$inst" ]; then
             local name=$(jq -r '.name' "$inst")
             local pid=$(jq -r '.pid' "$inst")
@@ -555,7 +555,7 @@ cleanup() {
     
     # Remove instances
     if [ -d "instances" ]; then
-        rm -rf instances/*
+        rm -rf "${WORK_DIR}"/instances/*
         print_info "Cleaned up instance data"
     fi
     
