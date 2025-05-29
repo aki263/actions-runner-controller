@@ -291,6 +291,7 @@ launch_vm() {
     local github_token=""
     local labels="firecracker"
     local use_cloud_init=true
+    local custom_kernel=""
     
     # Parse launch arguments
     while [[ $# -gt 0 ]]; do
@@ -302,6 +303,7 @@ launch_vm() {
             --labels) labels="$2"; shift 2 ;;
             --memory) VM_MEMORY="$2"; shift 2 ;;
             --cpus) VM_CPUS="$2"; shift 2 ;;
+            --kernel) custom_kernel="$2"; shift 2 ;;
             --no-cloud-init) use_cloud_init=false; shift ;;
             *) print_error "Unknown option: $1"; exit 1 ;;
         esac
@@ -493,10 +495,20 @@ EOF
         genisoimage -output cloud-init.iso -volid cidata -joliet -rock cloud-init/user-data cloud-init/meta-data >/dev/null 2>&1
     fi
     
-    # Download kernel if needed
-    if [ ! -f "vmlinux" ]; then
-        print_info "Downloading kernel..."
-        curl -fsSL -o vmlinux "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/x86_64/vmlinux-6.1.128"
+    # Setup kernel
+    if [ -n "$custom_kernel" ]; then
+        if [ ! -f "$custom_kernel" ]; then
+            print_error "Custom kernel not found: $custom_kernel"
+            exit 1
+        fi
+        print_info "Using custom kernel: $custom_kernel"
+        cp "$custom_kernel" "vmlinux"
+    else
+        # Download kernel if needed
+        if [ ! -f "vmlinux" ]; then
+            print_info "Downloading default kernel..."
+            curl -fsSL -o vmlinux "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/x86_64/vmlinux-6.1.128"
+        fi
     fi
     
     # Start Firecracker
@@ -695,6 +707,7 @@ usage() {
     echo "  --labels <labels>         Runner labels (comma-separated)"
     echo "  --memory <mb>             VM memory (default: 2048)"
     echo "  --cpus <count>            VM CPUs (default: 2)"
+    echo "  --kernel <path>           Use custom kernel (default: download official)"
     echo "  --no-cloud-init           Disable cloud-init for manual testing"
     echo ""
     echo "Examples:"
@@ -702,6 +715,7 @@ usage() {
     echo "  $0 snapshot prod-v1"
     echo "  $0 launch --github-url https://github.com/org/repo --github-token ghp_xxx"
     echo "  $0 launch --snapshot prod-v1 --no-cloud-init --name test-vm"
+    echo "  $0 launch --kernel ./custom-vmlinux --snapshot prod-v1 --no-cloud-init"
     echo "  $0 stop test-vm"
     echo "  $0 stop runner-.*"
     echo "  $0 cleanup"
