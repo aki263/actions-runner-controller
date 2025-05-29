@@ -290,6 +290,7 @@ launch_vm() {
     local github_url=""
     local github_token=""
     local labels="firecracker"
+    local use_cloud_init=true
     
     # Parse launch arguments
     while [[ $# -gt 0 ]]; do
@@ -301,13 +302,15 @@ launch_vm() {
             --labels) labels="$2"; shift 2 ;;
             --memory) VM_MEMORY="$2"; shift 2 ;;
             --cpus) VM_CPUS="$2"; shift 2 ;;
+            --no-cloud-init) use_cloud_init=false; shift ;;
             *) print_error "Unknown option: $1"; exit 1 ;;
         esac
     done
     
-    if [ -z "$github_url" ] || [ -z "$github_token" ]; then
-        print_error "GitHub URL and token are required"
+    if [ "$use_cloud_init" = true ] && ([ -z "$github_url" ] || [ -z "$github_token" ]); then
+        print_error "GitHub URL and token are required (or use --no-cloud-init for testing)"
         print_info "Usage: $0 launch --github-url <url> --github-token <token> [options]"
+        print_info "   Or: $0 launch --snapshot <name> --no-cloud-init"
         exit 1
     fi
     
@@ -341,39 +344,12 @@ launch_vm() {
     # Generate SSH key
     ssh-keygen -t rsa -b 4096 -f "ssh_key" -N "" -C "$runner_name" >/dev/null 2>&1
     
-    # Create cloud-init config
-    mkdir -p cloud-init
-    cat > cloud-init/user-data <<EOF
-#cloud-config
-hostname: ${runner_name}
-users:
-  - name: runner
-    ssh_authorized_keys:
-      - $(cat ssh_key.pub)
-    sudo: ALL=(ALL) NOPASSWD:ALL
-
-write_files:
-  - path: /etc/environment
-    content: |
-      GITHUB_TOKEN=${github_token}
-      GITHUB_URL=${github_url}
-      RUNNER_NAME=${runner_name}
-      RUNNER_LABELS=${labels}
-
-runcmd:
-  - /usr/local/bin/setup-runner.sh
-EOF
-    
-    echo "instance-id: ${vm_id}" > cloud-init/meta-data
-    
-    # Create cloud-init ISO
-    genisoimage -output cloud-init.iso -volid cidata -joliet -rock cloud-init/user-data cloud-init/meta-data >/dev/null 2>&1
-    
     # Setup networking
     local tap_device="tap-${vm_id}"
     local vm_ip="172.16.0.2"
     local host_ip="172.16.0.1"
     
+    print_info "Setting up networking..."
     sudo ip tuntap add dev "$tap_device" mode tap 2>/dev/null || true
     sudo ip addr add "${host_ip}/30" dev "$tap_device" 2>/dev/null || true
     sudo ip link set dev "$tap_device" up
@@ -382,6 +358,140 @@ EOF
     sudo sh -c "echo 1 > /proc/sys/net/ipv4/ip_forward"
     local host_iface=$(ip route | grep default | awk '{print $5}' | head -1)
     sudo iptables -t nat -A POSTROUTING -o "$host_iface" -j MASQUERADE 2>/dev/null || true
+    
+    if [ "$use_cloud_init" = true ]; then
+        # Create cloud-init config with proper network configuration
+        mkdir -p cloud-init
+        cat > cloud-init/user-data <<EOF
+#cloud-config
+hostname: ${runner_name}
+
+# Network configuration
+network:
+  version: 2
+  ethernets:
+    eth0:
+      addresses:
+        - ${vm_ip}/30
+      routes:
+        - to: default
+          via: ${host_ip}
+      nameservers:
+        addresses:
+          - 8.8.8.8
+          - 8.8.4.4
+
+users:
+  - name: runner
+    ssh_authorized_keys:
+      - $(cat ssh_key.pub)
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+
+# Disable automatic package updates during boot
+package_update: false
+package_upgrade: false
+
+write_files:
+  - path: /etc/environment
+    content: |
+      GITHUB_TOKEN=${github_token}
+      GITHUB_URL=${github_url}
+      RUNNER_NAME=${runner_name}
+      RUNNER_LABELS=${labels}
+  - path: /etc/systemd/system/setup-network.service
+    content: |
+      [Unit]
+      Description=Setup Network
+      Before=ssh.service
+      After=network.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/bin/bash -c 'ip addr add ${vm_ip}/30 dev eth0 || true; ip route add default via ${host_ip} || true'
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - systemctl enable setup-network
+  - systemctl start setup-network
+  - /usr/local/bin/setup-runner.sh
+
+ssh_pwauth: false
+disable_root: false
+EOF
+
+        cat > cloud-init/meta-data <<EOF
+instance-id: ${vm_id}
+local-hostname: ${runner_name}
+EOF
+
+        cat > cloud-init/network-config <<EOF
+version: 2
+ethernets:
+  eth0:
+    addresses:
+      - ${vm_ip}/30
+    routes:
+      - to: default
+        via: ${host_ip}
+    nameservers:
+      addresses:
+        - 8.8.8.8
+        - 8.8.4.4
+EOF
+        
+        # Create cloud-init ISO
+        genisoimage -output cloud-init.iso -volid cidata -joliet -rock cloud-init/user-data cloud-init/meta-data cloud-init/network-config >/dev/null 2>&1
+        
+        print_info "Cloud-init enabled - runner will auto-configure"
+    else
+        # No cloud-init - create minimal user setup
+        print_info "Cloud-init disabled - manual SSH access only"
+        
+        # Mount and add SSH key manually
+        local mount_dir="rootfs_mount"
+        mkdir -p "$mount_dir"
+        sudo mount -o loop rootfs.ext4 "$mount_dir"
+        
+        # Create runner user if it doesn't exist
+        sudo chroot "$mount_dir" useradd -m -s /bin/bash runner 2>/dev/null || true
+        sudo chroot "$mount_dir" usermod -aG sudo runner
+        
+        # Add SSH key
+        sudo mkdir -p "${mount_dir}/home/runner/.ssh"
+        sudo cp ssh_key.pub "${mount_dir}/home/runner/.ssh/authorized_keys"
+        sudo chroot "$mount_dir" chown -R runner:runner /home/runner/.ssh
+        sudo chroot "$mount_dir" chmod 700 /home/runner/.ssh
+        sudo chroot "$mount_dir" chmod 600 /home/runner/.ssh/authorized_keys
+        
+        # Configure static IP
+        sudo tee "${mount_dir}/etc/systemd/network/10-eth0.network" > /dev/null <<EOF
+[Match]
+Name=eth0
+
+[Network]
+Address=${vm_ip}/30
+Gateway=${host_ip}
+DNS=8.8.8.8
+DNS=8.8.4.4
+EOF
+        
+        # Enable systemd-networkd
+        sudo chroot "$mount_dir" systemctl enable systemd-networkd
+        sudo chroot "$mount_dir" systemctl enable ssh
+        
+        sudo umount "$mount_dir"
+        rmdir "$mount_dir"
+        
+        # Create empty cloud-init ISO to satisfy Firecracker
+        mkdir -p cloud-init
+        echo "{}" > cloud-init/user-data
+        echo "instance-id: ${vm_id}" > cloud-init/meta-data
+        genisoimage -output cloud-init.iso -volid cidata -joliet -rock cloud-init/user-data cloud-init/meta-data >/dev/null 2>&1
+    fi
     
     # Download kernel if needed
     if [ ! -f "vmlinux" ]; then
@@ -585,13 +695,20 @@ usage() {
     echo "  --labels <labels>         Runner labels (comma-separated)"
     echo "  --memory <mb>             VM memory (default: 2048)"
     echo "  --cpus <count>            VM CPUs (default: 2)"
+    echo "  --no-cloud-init           Disable cloud-init for manual testing"
     echo ""
     echo "Examples:"
     echo "  $0 build"
     echo "  $0 snapshot prod-v1"
     echo "  $0 launch --github-url https://github.com/org/repo --github-token ghp_xxx"
+    echo "  $0 launch --snapshot prod-v1 --no-cloud-init --name test-vm"
+    echo "  $0 stop test-vm"
     echo "  $0 stop runner-.*"
     echo "  $0 cleanup"
+    echo ""
+    echo "Testing without cloud-init:"
+    echo "  $0 launch --snapshot <name> --no-cloud-init"
+    echo "  # Then SSH: ssh -i /path/to/instance/ssh_key runner@172.16.0.2"
 }
 
 # Interactive demo
