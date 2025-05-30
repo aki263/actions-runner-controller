@@ -265,6 +265,12 @@ build_filesystem() {
     mkdir -p "${mount_dir}"
     sudo mount "${image_file}" "${mount_dir}"
     
+    # Mount proc and sys for proper chroot environment
+    print_info "Setting up chroot environment..."
+    sudo mount -t proc proc "${mount_dir}/proc"
+    sudo mount -t sysfs sysfs "${mount_dir}/sys"
+    sudo mount -t devtmpfs dev "${mount_dir}/dev" || sudo mount --bind /dev "${mount_dir}/dev"
+    
     print_info "Installing Ubuntu 24.04 base system..."
     
     # Install comprehensive package set for GitHub Actions compatibility
@@ -395,14 +401,27 @@ EOF
     
     # Install additional tools from ubuntu-24-packages.md
     print_info "Installing additional development tools..."
+    
+    # Install packages that are definitely available
     sudo chroot "${mount_dir}" apt-get install -y \
         ansible cmake git-lfs \
         python3-dev python-is-python3 ruby \
-        openjdk-8-jdk openjdk-11-jdk openjdk-21-jdk \
         postgresql-client mysql-client sqlite3 \
-        firefox chromium-browser \
         xvfb mediainfo parallel rsync \
         2>/dev/null || true
+    
+    # Install Java packages (may not all be available)
+    print_info "Installing Java development kits..."
+    sudo chroot "${mount_dir}" apt-get install -y \
+        openjdk-8-jdk openjdk-11-jdk openjdk-17-jdk openjdk-21-jdk \
+        2>/dev/null || print_warning "Some Java versions may not be available"
+    
+    # Install browsers (may have different package names)
+    print_info "Installing browsers..."
+    sudo chroot "${mount_dir}" apt-get install -y firefox 2>/dev/null || true
+    sudo chroot "${mount_dir}" apt-get install -y chromium 2>/dev/null || \
+    sudo chroot "${mount_dir}" apt-get install -y chromium-browser 2>/dev/null || \
+    print_warning "Chromium browser package not found"
     
     # Install tools that may not be in main repos
     print_info "Installing additional tools via alternative methods..."
@@ -416,8 +435,16 @@ EOF
     # Cleanup
     sudo chroot "${mount_dir}" apt-get clean
     sudo chroot "${mount_dir}" rm -rf /var/lib/apt/lists/*
+    
+    # Properly unmount all filesystems
+    print_info "Cleaning up mount points..."
+    sudo umount "${mount_dir}/dev" 2>/dev/null || true
+    sudo umount "${mount_dir}/sys" 2>/dev/null || true  
+    sudo umount "${mount_dir}/proc" 2>/dev/null || true
     sudo umount "${mount_dir}"
-    rmdir "${mount_dir}"
+    
+    # Now safe to remove directory
+    rmdir "${mount_dir}" 2>/dev/null || sudo rm -rf "${mount_dir}"
     
     local size=$(du -h "${image_file}" | cut -f1)
     print_info "✅ Filesystem created: ${image_file} (${size})"
