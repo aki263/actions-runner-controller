@@ -909,6 +909,35 @@ runcmd:
 ssh_pwauth: false
 EOF
 
+        # Add network configuration based on networking approach
+        if [ "$use_dhcp" = true ]; then
+            # DHCP configuration for host bridge networking
+            cat >> cloud-init/user-data <<'EOF'
+  - path: /etc/systemd/network/10-eth0.network
+    content: |
+      [Match]
+      Name=eth0
+      
+      [Network]
+      DHCP=yes
+      DNS=8.8.8.8
+      DNS=8.8.4.4
+EOF
+        else
+            # Static IP configuration
+            cat >> cloud-init/user-data <<EOF
+  - path: /etc/systemd/network/10-eth0.network
+    content: |
+      [Match]
+      Name=eth0
+      
+      [Network]
+      Address=${vm_ip}/24
+      Gateway=${gateway_ip}
+      DNS=8.8.8.8
+      DNS=8.8.4.4
+EOF
+        fi
         
         echo "{}" > cloud-init/network-config
         echo "instance-id: ${vm_id}" > cloud-init/meta-data
