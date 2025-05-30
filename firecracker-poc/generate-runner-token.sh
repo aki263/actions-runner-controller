@@ -2,6 +2,11 @@
 
 # GitHub Runner Token Generator
 # Generates short-lived registration tokens using GitHub API (like ARC does)
+# 
+# SECURITY: This script uses your PAT to generate short-lived registration tokens.
+# The registration token should be passed to VMs/containers, NOT the PAT.
+# PATs have broader permissions and should remain on trusted hosts only.
+#
 # Usage: ./generate-runner-token.sh --github-url <url> --github-pat <pat>
 
 set -euo pipefail
