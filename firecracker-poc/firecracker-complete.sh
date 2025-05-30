@@ -270,8 +270,8 @@ build_filesystem() {
     # Install comprehensive package set for GitHub Actions compatibility
     # Updated for Ubuntu 24.04 (noble) package names
     local packages="openssh-server,curl,wget,vim,htop,systemd,init,sudo,ca-certificates,cloud-init,jq,unzip,zip,git,iptables"
-    packages+=",build-essential,python3,python3-venv,python3-setuptools,openjdk-17-jdk"
-    packages+=",libsqlite3-dev,libssl-dev,pkg-config,autoconf,automake,libtool"
+    # packages+=",build-essential,python3,python3-venv,python3-setuptools,openjdk-17-jdk"
+    # packages+=",libsqlite3-dev,libssl-dev,pkg-config,autoconf,automake,libtool"
     packages+=",bison,flex,make,gcc,g++,binutils,file,gnupg,lsb-release"
     packages+=",software-properties-common,gpg-agent"
     
