@@ -402,7 +402,17 @@ launch_vm() {
         
         # Setup TAP device
         sudo ip tuntap add dev "$tap_device" mode tap 2>/dev/null || true
-        sudo ip addr add "${host_ip}/30" dev "$tap_device" 2>/dev/null || true
+        
+        # Check if gateway IP is already configured on any interface
+        if ! ip addr show | grep -q "172.16.0.1/24"; then
+            # First TAP device - configure the gateway
+            sudo ip addr add "${host_ip}/24" dev "$tap_device" 2>/dev/null || true
+            print_info "Configured gateway ${host_ip}/24 on ${tap_device}"
+        else
+            # Additional TAP devices - just bring up without IP
+            print_info "Gateway already configured, just bringing up ${tap_device}"
+        fi
+        
         sudo ip link set dev "$tap_device" up
     fi
     
@@ -481,7 +491,7 @@ network:
   ethernets:
     eth0:
       addresses:
-        - ${vm_ip}/30
+        - ${vm_ip}/24
       routes:
         - to: default
           via: ${host_ip}
@@ -517,7 +527,7 @@ write_files:
 
       [Service]
       Type=oneshot
-      ExecStart=/bin/bash -c 'ip addr add ${vm_ip}/30 dev eth0 || true; ip route add default via ${host_ip} || true'
+      ExecStart=/bin/bash -c 'ip addr add ${vm_ip}/24 dev eth0 || true; ip route add default via ${host_ip} || true'
       RemainAfterExit=yes
 
       [Install]
@@ -537,7 +547,7 @@ version: 2
 ethernets:
   eth0:
     addresses:
-      - ${vm_ip}/30
+      - ${vm_ip}/24
     routes:
       - to: default
         via: ${host_ip}
@@ -595,7 +605,7 @@ EOF
 Name=eth0
 
 [Network]
-Address=${vm_ip}/30
+Address=${vm_ip}/24
 Gateway=${host_ip}
 DNS=8.8.8.8
 DNS=8.8.4.4

@@ -142,4 +142,41 @@ ssh -i firecracker-data/instances/test-vm-2*/ssh_key runner@172.16.0.123
 2. **Automatic Allocation**: No manual IP management needed
 3. **Flexible Options**: Choose static or DHCP based on needs
 4. **Clean Architecture**: Each VM gets its own TAP device and network config
-5. **Easy Testing**: Multiple kernel tests in parallel 
+5. **Easy Testing**: Multiple kernel tests in parallel
+
+## Important: Networking Fix
+
+### Issue Found
+The initial implementation had a critical networking flaw:
+- Multiple TAP devices were assigned the same gateway IP `172.16.0.1/30`
+- This created routing conflicts and prevented proper VM communication
+
+### Fix Applied
+- **Changed from**: `/30` subnets (4 IPs total per TAP device)
+- **Changed to**: `/24` subnet (256 IPs shared across all VMs)
+- **Result**: Single gateway `172.16.0.1/24` shared by all TAP devices
+
+### If You Have Existing Conflicts
+Run the fix script on your Linux server:
+```bash
+./fix-networking.sh
+```
+
+This will:
+1. Stop all running VMs
+2. Remove conflicting TAP devices  
+3. Clean up DHCP servers
+4. Allow fresh start with correct networking
+
+### Correct Networking After Fix
+```bash
+# After fix, you should see:
+# - One gateway IP: 172.16.0.1/24 (on first TAP device)
+# - Other TAP devices: no IP assigned (bridge mode)
+# - VMs get unique IPs: 172.16.0.10, 172.16.0.47, 172.16.0.123, etc.
+
+# Test multiple VMs:
+./firecracker-runner.sh launch --snapshot runner-20250529-222120 --no-cloud-init --name vm1
+./firecracker-runner.sh launch --snapshot runner-20250529-222120 --no-cloud-init --name vm2  
+./firecracker-runner.sh list  # Should show different IPs for each VM
+``` 
