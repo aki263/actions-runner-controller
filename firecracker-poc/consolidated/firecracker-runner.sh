@@ -292,6 +292,7 @@ launch_vm() {
     local labels="firecracker"
     local use_cloud_init=true
     local custom_kernel=""
+    local use_dhcp=false
     
     # Parse launch arguments
     while [[ $# -gt 0 ]]; do
@@ -304,6 +305,7 @@ launch_vm() {
             --memory) VM_MEMORY="$2"; shift 2 ;;
             --cpus) VM_CPUS="$2"; shift 2 ;;
             --kernel) custom_kernel="$2"; shift 2 ;;
+            --dhcp) use_dhcp=true; shift ;;
             --no-cloud-init) use_cloud_init=false; shift ;;
             *) print_error "Unknown option: $1"; exit 1 ;;
         esac
@@ -348,27 +350,132 @@ launch_vm() {
     
     # Setup networking
     local tap_device="tap-${vm_id}"
-    local vm_ip="172.16.0.2"
-    local host_ip="172.16.0.1"
+    local vm_ip=""
+    local host_ip=""
+    local subnet_mask="24"
     
-    print_info "Setting up networking..."
-    sudo ip tuntap add dev "$tap_device" mode tap 2>/dev/null || true
-    sudo ip addr add "${host_ip}/30" dev "$tap_device" 2>/dev/null || true
-    sudo ip link set dev "$tap_device" up
+    if [ "$use_dhcp" = true ]; then
+        print_info "Setting up DHCP networking..."
+        
+        # Use broader subnet for DHCP
+        local network_base="172.16.0"
+        host_ip="${network_base}.1"
+        
+        # Setup TAP device
+        sudo ip tuntap add dev "$tap_device" mode tap 2>/dev/null || true
+        sudo ip addr add "${host_ip}/${subnet_mask}" dev "$tap_device" 2>/dev/null || true
+        sudo ip link set dev "$tap_device" up
+        
+        # Check if dnsmasq is available for DHCP
+        if command -v dnsmasq &> /dev/null; then
+            # Kill any existing dnsmasq for this interface
+            sudo pkill -f "dnsmasq.*${tap_device}" 2>/dev/null || true
+            
+            # Start DHCP server (IP range .100-.200)
+            sudo dnsmasq \
+                --interface="$tap_device" \
+                --dhcp-range="${network_base}.100,${network_base}.200,12h" \
+                --dhcp-option=3,"$host_ip" \
+                --dhcp-option=6,8.8.8.8,8.8.4.4 \
+                --pid-file="/tmp/dnsmasq-${tap_device}.pid" \
+                --log-dhcp &
+            
+            vm_ip="dhcp"  # Will be assigned dynamically
+            print_info "DHCP server started on ${tap_device} (range: ${network_base}.100-200)"
+        else
+            print_warning "dnsmasq not found, falling back to static IP"
+            use_dhcp=false
+        fi
+    fi
+    
+    if [ "$use_dhcp" = false ]; then
+        print_info "Setting up static IP networking..."
+        
+        # Generate unique IP based on VM ID hash
+        local ip_suffix=$((16#$(echo "$vm_id" | sha256sum | head -c 2) % 200 + 10))
+        if [ $ip_suffix -eq 1 ]; then ip_suffix=10; fi  # Avoid gateway IP
+        
+        vm_ip="172.16.0.${ip_suffix}"
+        host_ip="172.16.0.1"
+        
+        print_info "Assigned static IP: $vm_ip"
+        
+        # Setup TAP device
+        sudo ip tuntap add dev "$tap_device" mode tap 2>/dev/null || true
+        sudo ip addr add "${host_ip}/30" dev "$tap_device" 2>/dev/null || true
+        sudo ip link set dev "$tap_device" up
+    fi
     
     # Enable forwarding
     sudo sh -c "echo 1 > /proc/sys/net/ipv4/ip_forward"
     local host_iface=$(ip route | grep default | awk '{print $5}' | head -1)
     sudo iptables -t nat -A POSTROUTING -o "$host_iface" -j MASQUERADE 2>/dev/null || true
     
+    # Configure cloud-init or manual setup
     if [ "$use_cloud_init" = true ]; then
-        # Create cloud-init config with proper network configuration
+        # Create cloud-init config with network configuration
         mkdir -p cloud-init
-        cat > cloud-init/user-data <<EOF
+        
+        if [ "$use_dhcp" = true ]; then
+            # DHCP network config
+            cat > cloud-init/user-data <<EOF
 #cloud-config
 hostname: ${runner_name}
 
-# Network configuration
+# Network configuration (DHCP)
+network:
+  version: 2
+  ethernets:
+    eth0:
+      dhcp4: true
+      nameservers:
+        addresses:
+          - 8.8.8.8
+          - 8.8.4.4
+
+users:
+  - name: runner
+    ssh_authorized_keys:
+      - $(cat ssh_key.pub)
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+
+# Disable automatic package updates during boot
+package_update: false
+package_upgrade: false
+
+write_files:
+  - path: /etc/environment
+    content: |
+      GITHUB_TOKEN=${github_token}
+      GITHUB_URL=${github_url}
+      RUNNER_NAME=${runner_name}
+      RUNNER_LABELS=${labels}
+
+runcmd:
+  - /usr/local/bin/setup-runner.sh
+
+ssh_pwauth: false
+disable_root: false
+EOF
+
+            cat > cloud-init/network-config <<EOF
+version: 2
+ethernets:
+  eth0:
+    dhcp4: true
+    nameservers:
+      addresses:
+        - 8.8.8.8
+        - 8.8.4.4
+EOF
+        else
+            # Static IP network config
+            cat > cloud-init/user-data <<EOF
+#cloud-config
+hostname: ${runner_name}
+
+# Network configuration (Static IP)
 network:
   version: 2
   ethernets:
@@ -425,12 +532,7 @@ ssh_pwauth: false
 disable_root: false
 EOF
 
-        cat > cloud-init/meta-data <<EOF
-instance-id: ${vm_id}
-local-hostname: ${runner_name}
-EOF
-
-        cat > cloud-init/network-config <<EOF
+            cat > cloud-init/network-config <<EOF
 version: 2
 ethernets:
   eth0:
@@ -443,6 +545,12 @@ ethernets:
       addresses:
         - 8.8.8.8
         - 8.8.4.4
+EOF
+        fi
+        
+        cat > cloud-init/meta-data <<EOF
+instance-id: ${vm_id}
+local-hostname: ${runner_name}
 EOF
         
         # Create cloud-init ISO
@@ -469,8 +577,20 @@ EOF
         sudo chroot "$mount_dir" chmod 700 /home/runner/.ssh
         sudo chroot "$mount_dir" chmod 600 /home/runner/.ssh/authorized_keys
         
-        # Configure static IP
-        sudo tee "${mount_dir}/etc/systemd/network/10-eth0.network" > /dev/null <<EOF
+        if [ "$use_dhcp" = true ]; then
+            # Configure DHCP
+            sudo tee "${mount_dir}/etc/systemd/network/10-eth0.network" > /dev/null <<EOF
+[Match]
+Name=eth0
+
+[Network]
+DHCP=yes
+DNS=8.8.8.8
+DNS=8.8.4.4
+EOF
+        else
+            # Configure static IP
+            sudo tee "${mount_dir}/etc/systemd/network/10-eth0.network" > /dev/null <<EOF
 [Match]
 Name=eth0
 
@@ -480,6 +600,7 @@ Gateway=${host_ip}
 DNS=8.8.8.8
 DNS=8.8.4.4
 EOF
+        fi
         
         # Enable systemd-networkd
         sudo chroot "$mount_dir" systemctl enable systemd-networkd
@@ -670,8 +791,14 @@ cleanup() {
     # Stop all instances
     stop_instances
     
+    # Clean up DHCP servers
+    print_info "Stopping DHCP servers..."
+    sudo pkill -f "dnsmasq.*tap-" 2>/dev/null || true
+    rm -f /tmp/dnsmasq-tap-*.pid 2>/dev/null || true
+    
     # Clean up TAP devices
     for tap in $(ip link show | grep -o 'tap-[a-f0-9]*' || true); do
+        print_info "Removing TAP device: $tap"
         sudo ip link del "$tap" 2>/dev/null || true
     done
     
@@ -708,6 +835,7 @@ usage() {
     echo "  --memory <mb>             VM memory (default: 2048)"
     echo "  --cpus <count>            VM CPUs (default: 2)"
     echo "  --kernel <path>           Use custom kernel (default: download official)"
+    echo "  --dhcp                    Use DHCP for IP assignment (default: static)"
     echo "  --no-cloud-init           Disable cloud-init for manual testing"
     echo ""
     echo "Examples:"
@@ -716,13 +844,18 @@ usage() {
     echo "  $0 launch --github-url https://github.com/org/repo --github-token ghp_xxx"
     echo "  $0 launch --snapshot prod-v1 --no-cloud-init --name test-vm"
     echo "  $0 launch --kernel ./custom-vmlinux --snapshot prod-v1 --no-cloud-init"
+    echo "  $0 launch --dhcp --snapshot prod-v1 --no-cloud-init --name dhcp-test"
     echo "  $0 stop test-vm"
     echo "  $0 stop runner-.*"
     echo "  $0 cleanup"
     echo ""
+    echo "Networking options:"
+    echo "  Static IP: Each VM gets unique IP (172.16.0.10-210)"
+    echo "  DHCP:      Requires dnsmasq, IPs assigned dynamically (172.16.0.100-200)"
+    echo ""
     echo "Testing without cloud-init:"
     echo "  $0 launch --snapshot <name> --no-cloud-init"
-    echo "  # Then SSH: ssh -i /path/to/instance/ssh_key runner@172.16.0.2"
+    echo "  # Then SSH: ssh -i /path/to/instance/ssh_key runner@<vm-ip>"
 }
 
 # Interactive demo

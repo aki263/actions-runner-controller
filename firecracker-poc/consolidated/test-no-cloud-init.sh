@@ -15,7 +15,29 @@ echo "2. Listing available resources..."
 ./firecracker-runner.sh list
 
 echo ""
-echo "3. Choose kernel option:"
+echo "3. Choose network configuration:"
+echo "   a) Static IP (unique per VM)"
+echo "   b) DHCP (requires dnsmasq)"
+echo ""
+read -p "Enter choice (a/b): " network_choice
+
+if [ "$network_choice" = "b" ]; then
+    # Check if dnsmasq is available
+    if ! command -v dnsmasq &> /dev/null; then
+        echo "Warning: dnsmasq not found. Install with: sudo apt install dnsmasq"
+        echo "Falling back to static IP..."
+        network_option=""
+    else
+        network_option="--dhcp"
+        echo "Using DHCP networking"
+    fi
+else
+    network_option=""
+    echo "Using static IP networking"
+fi
+
+echo ""
+echo "4. Choose kernel option:"
 echo "   a) Use default kernel (downloaded automatically)"
 echo "   b) Use custom kernel"
 echo ""
@@ -61,20 +83,23 @@ else
 fi
 
 echo ""
-echo "3. Launching VM without cloud-init for testing..."
-echo "   Command: ./firecracker-runner.sh launch --snapshot runner-20250529-222120 --no-cloud-init --name test-vm $kernel_option"
+echo "5. Launching VM without cloud-init for testing..."
+echo "   Command: ./firecracker-runner.sh launch --snapshot runner-20250529-222120 --no-cloud-init --name test-vm $kernel_option $network_option"
 echo ""
 
 # Ask user to confirm
 read -p "Press Enter to launch, or Ctrl+C to cancel..."
 
-./firecracker-runner.sh launch --snapshot runner-20250529-222120 --no-cloud-init --name test-vm $kernel_option
+./firecracker-runner.sh launch --snapshot runner-20250529-222120 --no-cloud-init --name test-vm $kernel_option $network_option
 
 echo ""
-echo "4. If successful, you should be able to SSH with:"
-echo "   ssh -i firecracker-data/instances/*/ssh_key runner@172.16.0.2"
+echo "6. If successful, you should be able to SSH with:"
+echo "   # Check VM IP first:"
+echo "   ./firecracker-runner.sh list"
+echo "   # Then SSH (replace <VM-IP> with actual IP):"
+echo "   ssh -i firecracker-data/instances/*/ssh_key runner@<VM-IP>"
 echo ""
-echo "5. Test commands in VM:"
+echo "7. Test commands in VM:"
 echo "   ip addr show eth0"
 echo "   ip route"
 echo "   ping 8.8.8.8"
