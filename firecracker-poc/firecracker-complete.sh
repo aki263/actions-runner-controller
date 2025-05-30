@@ -267,9 +267,22 @@ build_filesystem() {
     
     # Mount proc and sys for proper chroot environment
     print_info "Setting up chroot environment..."
-    sudo mount -t proc proc "${mount_dir}/proc"
-    sudo mount -t sysfs sysfs "${mount_dir}/sys"
-    sudo mount -t devtmpfs dev "${mount_dir}/dev" || sudo mount --bind /dev "${mount_dir}/dev"
+    sudo mkdir -p "${mount_dir}/proc" "${mount_dir}/sys" "${mount_dir}/dev" "${mount_dir}/tmp"
+    
+    # Mount with error checking
+    if ! sudo mount -t proc proc "${mount_dir}/proc" 2>/dev/null; then
+        print_warning "Failed to mount /proc, continuing without it"
+    fi
+    
+    if ! sudo mount -t sysfs sysfs "${mount_dir}/sys" 2>/dev/null; then
+        print_warning "Failed to mount /sys, continuing without it"
+    fi
+    
+    if ! sudo mount -t devtmpfs dev "${mount_dir}/dev" 2>/dev/null; then
+        if ! sudo mount --bind /dev "${mount_dir}/dev" 2>/dev/null; then
+            print_warning "Failed to mount /dev, continuing without it"
+        fi
+    fi
     
     print_info "Installing Ubuntu 24.04 base system..."
     
@@ -438,13 +451,32 @@ EOF
     
     # Properly unmount all filesystems
     print_info "Cleaning up mount points..."
-    sudo umount "${mount_dir}/dev" 2>/dev/null || true
-    sudo umount "${mount_dir}/sys" 2>/dev/null || true  
-    sudo umount "${mount_dir}/proc" 2>/dev/null || true
-    sudo umount "${mount_dir}"
+    
+    # Check what's actually mounted and unmount in reverse order
+    if mountpoint -q "${mount_dir}/dev" 2>/dev/null; then
+        sudo umount "${mount_dir}/dev" 2>/dev/null || print_warning "Failed to unmount /dev"
+    fi
+    
+    if mountpoint -q "${mount_dir}/sys" 2>/dev/null; then
+        sudo umount "${mount_dir}/sys" 2>/dev/null || print_warning "Failed to unmount /sys"
+    fi
+    
+    if mountpoint -q "${mount_dir}/proc" 2>/dev/null; then
+        sudo umount "${mount_dir}/proc" 2>/dev/null || print_warning "Failed to unmount /proc"
+    fi
+    
+    # Final unmount of the main filesystem
+    if mountpoint -q "${mount_dir}" 2>/dev/null; then
+        sudo umount "${mount_dir}" || {
+            print_error "Failed to unmount ${mount_dir}"
+            exit 1
+        }
+    fi
     
     # Now safe to remove directory
-    rmdir "${mount_dir}" 2>/dev/null || sudo rm -rf "${mount_dir}"
+    if [ -d "${mount_dir}" ]; then
+        rmdir "${mount_dir}" 2>/dev/null || sudo rm -rf "${mount_dir}"
+    fi
     
     local size=$(du -h "${image_file}" | cut -f1)
     print_info "✅ Filesystem created: ${image_file} (${size})"
