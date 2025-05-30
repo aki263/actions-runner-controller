@@ -392,27 +392,152 @@ EOF
     # Setup script for runner configuration
     sudo tee "${mount_dir}/usr/local/bin/setup-runner.sh" > /dev/null <<'EOF'
 #!/bin/bash
-if [ -z "$GITHUB_TOKEN" ] || [ -z "$GITHUB_URL" ]; then
-    echo "Missing GITHUB_TOKEN or GITHUB_URL environment variables"
-    exit 1
+set -euo pipefail
+
+# Logging function
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a /var/log/setup-runner.log
+}
+
+log "=== GitHub Actions Runner Setup Starting ==="
+
+# Check environment variables
+if [ -z "${GITHUB_TOKEN:-}" ] || [ -z "${GITHUB_URL:-}" ]; then
+    log "ERROR: Missing required environment variables"
+    log "GITHUB_TOKEN: ${GITHUB_TOKEN:-'(not set)'}"
+    log "GITHUB_URL: ${GITHUB_URL:-'(not set)'}"
+    log "Available environment:"
+    env | grep -E '^(GITHUB_|RUNNER_)' | sed 's/^/  /' || log "No GITHUB_/RUNNER_ vars found"
+    
+    # Try to source from /etc/environment
+    if [ -f /etc/environment ]; then
+        log "Attempting to source from /etc/environment"
+        set -a; source /etc/environment; set +a
+        log "After sourcing /etc/environment:"
+        env | grep -E '^(GITHUB_|RUNNER_)' | sed 's/^/  /' || log "Still no GITHUB_/RUNNER_ vars found"
+    fi
+    
+    if [ -z "${GITHUB_TOKEN:-}" ] || [ -z "${GITHUB_URL:-}" ]; then
+        log "ERROR: Still missing required environment variables after all attempts"
+        exit 1
+    fi
 fi
 
-# Start Docker
-systemctl start docker
-sleep 5
+log "Environment variables found:"
+log "GITHUB_URL: $GITHUB_URL"
+log "RUNNER_NAME: ${RUNNER_NAME:-$(hostname)}"
+log "RUNNER_LABELS: ${RUNNER_LABELS:-firecracker}"
+
+# Wait for network to be ready
+log "Waiting for network connectivity..."
+for i in {1..30}; do
+    if curl -s --connect-timeout 3 https://api.github.com/zen >/dev/null; then
+        log "Network connectivity confirmed"
+        break
+    fi
+    if [ $i -eq 30 ]; then
+        log "ERROR: Network connectivity timeout after 30 attempts"
+        exit 1
+    fi
+    log "Network not ready, attempt $i/30..."
+    sleep 2
+done
+
+# Start and verify Docker
+log "Starting Docker service..."
+systemctl start docker || {
+    log "ERROR: Failed to start Docker service"
+    systemctl status docker --no-pager | sed 's/^/  /' || true
+    exit 1
+}
+
+log "Waiting for Docker daemon to be ready..."
+for i in {1..30}; do
+    if docker info >/dev/null 2>&1; then
+        log "Docker daemon is ready"
+        break
+    fi
+    if [ $i -eq 30 ]; then
+        log "ERROR: Docker daemon not ready after 30 attempts"
+        docker info 2>&1 | sed 's/^/  /' || true
+        exit 1
+    fi
+    log "Docker daemon not ready, attempt $i/30..."
+    sleep 2
+done
+
+# Add runner user to docker group
+usermod -aG docker runner 2>/dev/null || log "Warning: Failed to add runner to docker group"
 
 # Configure runner
+log "Configuring GitHub Actions runner..."
 cd /opt/runner
+
+# Remove any existing configuration
+if [ -f .runner ]; then
+    log "Removing existing runner configuration..."
+    sudo -u runner ./config.sh remove --token "$GITHUB_TOKEN" || log "Warning: Failed to remove existing config"
+fi
+
+# Create work directory
+mkdir -p /tmp/runner-work
+chown runner:runner /tmp/runner-work
+
+log "Running runner configuration..."
 sudo -u runner ./config.sh \
     --url "$GITHUB_URL" \
     --token "$GITHUB_TOKEN" \
     --name "${RUNNER_NAME:-$(hostname)}" \
     --labels "${RUNNER_LABELS:-firecracker}" \
     --work "/tmp/runner-work" \
-    --unattended --replace
+    --unattended --replace || {
+    log "ERROR: Runner configuration failed"
+    log "Configuration output:"
+    ls -la | sed 's/^/  /' || true
+    exit 1
+}
 
-systemctl enable github-runner
-systemctl start github-runner
+log "Runner configuration successful"
+log "Configuration details:"
+if [ -f .runner ]; then
+    cat .runner | jq . | sed 's/^/  /' || cat .runner | sed 's/^/  /'
+else
+    log "ERROR: .runner file not created"
+    exit 1
+fi
+
+# Enable and start runner service
+log "Enabling GitHub runner service..."
+systemctl enable github-runner || {
+    log "ERROR: Failed to enable github-runner service"
+    exit 1
+}
+
+log "Starting GitHub runner service..."
+systemctl start github-runner || {
+    log "ERROR: Failed to start github-runner service"
+    systemctl status github-runner --no-pager | sed 's/^/  /' || true
+    exit 1
+}
+
+# Verify runner is running
+log "Verifying runner service status..."
+sleep 5
+if systemctl is-active --quiet github-runner; then
+    log "✅ GitHub runner service is running"
+    if pgrep -f "actions.runner" >/dev/null; then
+        log "✅ Runner process is active"
+    else
+        log "⚠️  Runner service is active but process not found"
+    fi
+else
+    log "❌ GitHub runner service is not running"
+    systemctl status github-runner --no-pager | sed 's/^/  /' || true
+    exit 1
+fi
+
+log "=== GitHub Actions Runner Setup Complete ==="
+log "Runner should now be visible in your GitHub repository/organization"
 EOF
     
     sudo chmod +x "${mount_dir}/usr/local/bin/setup-runner.sh"
@@ -598,6 +723,9 @@ launch_vm() {
     fi
     
     print_header "Launching VM: ${runner_name}"
+    
+    # Start timing
+    local start_time=$(date +%s)
     
     print_info "Debug: Current working directory: $(pwd)"
     print_info "Debug: Snapshot directory: ${snapshot_dir}"
@@ -888,7 +1016,10 @@ EOF
     for i in {1..30}; do
         if ping -c 1 -W 2 "$vm_ip" >/dev/null 2>&1; then
             if ssh -i "instances/${vm_id}/ssh_key" -o ConnectTimeout=3 -o StrictHostKeyChecking=no runner@"$vm_ip" 'echo ready' >/dev/null 2>&1; then
+                local end_time=$(date +%s)
+                local duration=$((end_time - start_time))
                 print_info "✅ VM is ready and accessible"
+                print_info "🕐 Total startup time: ${duration} seconds"
                 return 0
             fi
         fi
@@ -1023,6 +1154,179 @@ stop_vms() {
     [ $stopped -eq 0 ] && print_info "No matching VMs to stop" || print_info "Stopped $stopped VM(s)"
 }
 
+# Check VM status and diagnostics
+check_vm_status() {
+    local vm_pattern="${1:-.*}"
+    
+    print_header "VM Status and Diagnostics"
+    
+    if [ ! -d "instances" ]; then
+        print_info "No instances found"
+        return
+    fi
+    
+    for inst in instances/*/info.json; do
+        if [ -f "$inst" ]; then
+            local name=$(jq -r '.name' "$inst")
+            local ip=$(jq -r '.ip' "$inst")
+            local pid=$(jq -r '.pid' "$inst")
+            local vm_dir=$(dirname "$inst")
+            
+            if [[ "$name" =~ $vm_pattern ]]; then
+                echo
+                echo -e "${GREEN}VM: $name${NC}"
+                echo "================================"
+                
+                # Process status
+                if kill -0 "$pid" 2>/dev/null; then
+                    echo "✅ Firecracker process: Running (PID: $pid)"
+                else
+                    echo "❌ Firecracker process: Stopped"
+                    continue
+                fi
+                
+                # Network connectivity
+                if ping -c 1 -W 2 "$ip" >/dev/null 2>&1; then
+                    echo "✅ Network: Reachable ($ip)"
+                else
+                    echo "❌ Network: Not reachable ($ip)"
+                    continue
+                fi
+                
+                # SSH access
+                if ssh -i "${vm_dir}/ssh_key" -o ConnectTimeout=3 -o StrictHostKeyChecking=no runner@"$ip" 'echo ready' >/dev/null 2>&1; then
+                    echo "✅ SSH: Accessible"
+                    
+                    # Get system status via SSH
+                    echo "📊 System Status:"
+                    ssh -i "${vm_dir}/ssh_key" -o ConnectTimeout=5 -o StrictHostKeyChecking=no runner@"$ip" '
+                        echo "   Uptime: $(uptime | cut -d"," -f1 | cut -d" " -f4-)"
+                        echo "   Load: $(cat /proc/loadavg | cut -d" " -f1-3)"
+                        echo "   Memory: $(free -h | grep Mem | awk "{print \$3\"/\"\$2}")"
+                        echo "   Disk: $(df -h / | tail -1 | awk "{print \$3\"/\"\$2\" (\"\$5\")\"})"
+                    ' 2>/dev/null || echo "   Failed to get system info"
+                    
+                    # Check cloud-init status
+                    echo "☁️  Cloud-init Status:"
+                    ssh -i "${vm_dir}/ssh_key" -o ConnectTimeout=5 -o StrictHostKeyChecking=no runner@"$ip" '
+                        if systemctl is-active --quiet cloud-final; then
+                            echo "   ✅ cloud-final.service: $(systemctl show -p ActiveState --value cloud-final)"
+                        else
+                            echo "   ❌ cloud-final.service: $(systemctl show -p ActiveState --value cloud-final)"
+                            echo "   Last errors:"
+                            journalctl -u cloud-final --lines=3 --no-pager 2>/dev/null | sed "s/^/      /" || echo "      (no logs available)"
+                        fi
+                        
+                        if systemctl is-active --quiet cloud-init; then
+                            echo "   ✅ cloud-init.service: $(systemctl show -p ActiveState --value cloud-init)"
+                        else
+                            echo "   ❌ cloud-init.service: $(systemctl show -p ActiveState --value cloud-init)"
+                        fi
+                    ' 2>/dev/null || echo "   Failed to get cloud-init status"
+                    
+                    # Check GitHub runner status
+                    echo "🏃 GitHub Runner Status:"
+                    ssh -i "${vm_dir}/ssh_key" -o ConnectTimeout=5 -o StrictHostKeyChecking=no runner@"$ip" '
+                        if systemctl is-active --quiet github-runner; then
+                            echo "   ✅ github-runner.service: Running"
+                            if pgrep -f "actions.runner" >/dev/null; then
+                                echo "   ✅ Runner process: Active"
+                                echo "   📝 Runner logs (last 3 lines):"
+                                journalctl -u github-runner --lines=3 --no-pager 2>/dev/null | sed "s/^/      /" || echo "      (no logs available)"
+                            else
+                                echo "   ⚠️  Runner process: Not found"
+                            fi
+                        else
+                            echo "   ❌ github-runner.service: $(systemctl show -p ActiveState --value github-runner 2>/dev/null || echo "not found")"
+                        fi
+                        
+                        # Check if runner is configured
+                        if [ -f "/opt/runner/.runner" ]; then
+                            echo "   ✅ Runner configuration: Found"
+                            cat /opt/runner/.runner | jq -r "\"   🏷️  Runner name: \" + .agentName" 2>/dev/null || echo "   🏷️  Runner name: (failed to parse)"
+                        else
+                            echo "   ❌ Runner configuration: Missing"
+                        fi
+                        
+                        # Check environment variables
+                        if [ -f "/etc/environment" ]; then
+                            if grep -q "GITHUB_" /etc/environment; then
+                                echo "   ✅ Environment variables: Set"
+                            else
+                                echo "   ❌ Environment variables: Missing GITHUB_* vars"
+                            fi
+                        else
+                            echo "   ❌ Environment variables: /etc/environment missing"
+                        fi
+                    ' 2>/dev/null || echo "   Failed to get runner status"
+                    
+                    # Check Docker status
+                    echo "🐳 Docker Status:"
+                    ssh -i "${vm_dir}/ssh_key" -o ConnectTimeout=5 -o StrictHostKeyChecking=no runner@"$ip" '
+                        if systemctl is-active --quiet docker; then
+                            echo "   ✅ Docker service: Running"
+                            if docker info >/dev/null 2>&1; then
+                                echo "   ✅ Docker daemon: Accessible"
+                            else
+                                echo "   ❌ Docker daemon: Not accessible"
+                            fi
+                        else
+                            echo "   ❌ Docker service: $(systemctl show -p ActiveState --value docker 2>/dev/null || echo "not found")"
+                        fi
+                    ' 2>/dev/null || echo "   Failed to get Docker status"
+                    
+                else
+                    echo "❌ SSH: Not accessible"
+                fi
+            fi
+        fi
+    done
+}
+
+# Check runner status
+check_runner() {
+    local vm_pattern="${1:-.*}"
+    
+    if [ ! -d "instances" ]; then
+        print_info "No instances found"
+        return
+    fi
+    
+    print_header "GitHub Runner Status"
+    
+    for inst in instances/*/info.json; do
+        if [ -f "$inst" ]; then
+            local name=$(jq -r '.name' "$inst")
+            local ip=$(jq -r '.ip' "$inst")
+            local vm_dir=$(dirname "$inst")
+            
+            if [[ "$name" =~ $vm_pattern ]]; then
+                echo -e "${BLUE}$name ($ip):${NC}"
+                
+                if ssh -i "${vm_dir}/ssh_key" -o ConnectTimeout=3 -o StrictHostKeyChecking=no runner@"$ip" '
+                    if systemctl is-active --quiet github-runner && pgrep -f "actions.runner" >/dev/null; then
+                        echo "✅ Runner is running"
+                        if [ -f "/opt/runner/.runner" ]; then
+                            cat /opt/runner/.runner | jq -r "\"   Name: \" + .agentName + \", Pool: \" + .poolName" 2>/dev/null || echo "   (config available but failed to parse)"
+                        fi
+                    else
+                        echo "❌ Runner is not running"
+                        if systemctl --quiet is-failed github-runner; then
+                            echo "   Service failed. Last error:"
+                            journalctl -u github-runner --lines=2 --no-pager 2>/dev/null | tail -1 | sed "s/^/   /" || echo "   (no error logs)"
+                        fi
+                    fi
+                ' 2>/dev/null; then
+                    : # SSH command succeeded
+                else
+                    echo "❌ Cannot connect to VM"
+                fi
+                echo
+            fi
+        fi
+    done
+}
+
 # Cleanup everything  
 cleanup() {
     print_header "Cleaning Up"
@@ -1076,6 +1380,8 @@ usage() {
     echo "  launch [options]          Launch runner VM"
     echo "  list                      List all resources"
     echo "  stop [pattern]            Stop VMs (optional regex pattern)" 
+    echo "  status                    Check VM status and diagnostics"
+    echo "  check-runner              Check GitHub runner status"
     echo "  cleanup                   Stop all VMs and cleanup"
     echo ""
     echo "Build-Kernel Options:"
@@ -1115,6 +1421,8 @@ usage() {
     echo "  $0 launch --use-host-bridge --github-url https://github.com/org/repo --github-token ghp_xxx"
     echo "  $0 launch --skip-deps --no-cloud-init --name test  # Quick test"
     echo "  $0 list                            # Show all resources"
+    echo "  $0 status                          # Check VM status and diagnostics"
+    echo "  $0 check-runner                    # Check if GitHub runner is working"
     echo "  $0 cleanup                         # Stop everything"
 }
 
@@ -1178,6 +1486,14 @@ main() {
         stop)
             setup_workspace
             stop_vms "$@" 
+            ;;
+        status)
+            setup_workspace
+            check_vm_status "$@"
+            ;;
+        check-runner)
+            setup_workspace
+            check_runner "$@"
             ;;
         cleanup)
             setup_workspace
