@@ -118,7 +118,9 @@ check_dependencies() {
 
 setup_workspace() {
     mkdir -p "${WORK_DIR}"/{kernels,images,snapshots,instances}
+    print_info "Debug: Changing to work directory: ${WORK_DIR}"
     cd "${WORK_DIR}"
+    print_info "Debug: Now in: $(pwd)"
 }
 
 # Build custom kernel with Ubuntu 24.04 package support
@@ -588,14 +590,25 @@ launch_vm() {
     
     print_header "Launching VM: ${runner_name}"
     
+    print_info "Debug: Current working directory: $(pwd)"
+    print_info "Debug: Snapshot directory: ${snapshot_dir}"
+    print_info "Debug: Looking for snapshot at: ${snapshot_dir}/rootfs.ext4"
+    
     # Setup instance
     local vm_id=$(echo "$runner_name" | tr '[:upper:]' '[:lower:]' | head -c 8)
     local instance_dir="instances/${vm_id}"
     mkdir -p "$instance_dir"
+    
+    print_info "Debug: Instance directory: ${instance_dir}"
+    print_info "Debug: Changing to: $(pwd)/${instance_dir}"
+    
     cd "$instance_dir"
     
-    # Copy snapshot
-    cp "${snapshot_dir}/rootfs.ext4" "rootfs.ext4"
+    print_info "Debug: Now in directory: $(pwd)"
+    print_info "Debug: Will copy from: $(pwd)/../../${snapshot_dir}/rootfs.ext4"
+    
+    # Copy snapshot (adjust path since we're now in instances/vm-id/)
+    cp "../../${snapshot_dir}/rootfs.ext4" "rootfs.ext4"
     
     # Generate SSH key
     ssh-keygen -t rsa -b 4096 -f "ssh_key" -N "" -C "$runner_name" >/dev/null 2>&1
@@ -684,10 +697,11 @@ EOF
         fi
         cp "$custom_kernel" "vmlinux"
     else
-        # Use built kernel if available
-        local built_kernel="../../kernels/vmlinux-${KERNEL_VERSION}-ubuntu24"
+        # Use built kernel if available (we're already in firecracker-data)
+        local built_kernel="../kernels/vmlinux-${KERNEL_VERSION}-ubuntu24"
         if [ -f "$built_kernel" ]; then
             cp "$built_kernel" "vmlinux"
+            print_info "Using built kernel: $(basename "$built_kernel")"
         else
             # Download default kernel
             if [ ! -f "vmlinux" ]; then
