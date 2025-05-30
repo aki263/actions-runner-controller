@@ -268,16 +268,26 @@ build_filesystem() {
     print_info "Installing Ubuntu 24.04 base system..."
     
     # Install comprehensive package set for GitHub Actions compatibility
+    # Updated for Ubuntu 24.04 (noble) package names
     local packages="openssh-server,curl,wget,vim,htop,systemd,init,sudo,ca-certificates,cloud-init,jq,unzip,zip,git,iptables"
-    packages+=",build-essential,python3,python3-pip,nodejs,npm,openjdk-17-jdk"
+    packages+=",build-essential,python3,python3-venv,python3-setuptools,openjdk-17-jdk"
     packages+=",libsqlite3-dev,libssl-dev,pkg-config,autoconf,automake,libtool"
-    packages+=",bison,flex,make,gcc,g++,binutils,file,gnupg2,lsb-release"
-    packages+=",software-properties-common,apt-transport-https,gpg-agent"
+    packages+=",bison,flex,make,gcc,g++,binutils,file,gnupg,lsb-release"
+    packages+=",software-properties-common,gpg-agent"
     
     sudo debootstrap --include="$packages" \
         noble "${mount_dir}" http://archive.ubuntu.com/ubuntu/
     
     print_info "Configuring GitHub Actions runner environment..."
+    
+    # Install Node.js and npm after base system (more reliable)
+    print_info "Installing Node.js and npm..."
+    sudo chroot "${mount_dir}" bash -c "curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -"
+    sudo chroot "${mount_dir}" apt-get install -y nodejs
+    
+    # Install pip for Python
+    print_info "Installing Python pip..."
+    sudo chroot "${mount_dir}" python3 -m ensurepip --upgrade || true
     
     # Create runner user
     sudo chroot "${mount_dir}" useradd -m -s /bin/bash runner
@@ -386,13 +396,22 @@ EOF
     # Install additional tools from ubuntu-24-packages.md
     print_info "Installing additional development tools..."
     sudo chroot "${mount_dir}" apt-get install -y \
-        ansible bazel cmake git-lfs kubectl helm \
-        python3-dev python-is-python3 ruby nodejs \
+        ansible cmake git-lfs \
+        python3-dev python-is-python3 ruby \
         openjdk-8-jdk openjdk-11-jdk openjdk-21-jdk \
         postgresql-client mysql-client sqlite3 \
-        firefox-esr chromium-browser \
+        firefox chromium-browser \
         xvfb mediainfo parallel rsync \
         2>/dev/null || true
+    
+    # Install tools that may not be in main repos
+    print_info "Installing additional tools via alternative methods..."
+    
+    # Install kubectl
+    sudo chroot "${mount_dir}" bash -c "curl -LO 'https://dl.k8s.io/release/\$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl' && install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl && rm kubectl" 2>/dev/null || true
+    
+    # Install helm
+    sudo chroot "${mount_dir}" bash -c "curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash" 2>/dev/null || true
     
     # Cleanup
     sudo chroot "${mount_dir}" apt-get clean
