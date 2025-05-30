@@ -68,14 +68,34 @@ check_os() {
 }
 
 check_dependencies() {
-    local deps=("curl" "wget" "git" "make" "gcc" "bc" "flex" "bison" "libssl-dev" "libelf-dev" "qemu-img" "debootstrap" "jq" "firecracker" "ssh-keygen")
+    # Allow skipping dependency checks via environment variable
+    if [[ "${SKIP_DEPS:-false}" == "true" ]]; then
+        print_warning "Skipping dependency checks (SKIP_DEPS=true)"
+        return 0
+    fi
+    
+    local command_deps=("curl" "wget" "git" "make" "gcc" "bc" "flex" "bison" "qemu-img" "debootstrap" "jq" "firecracker" "ssh-keygen")
+    local library_deps=("libssl-dev" "libelf-dev")
     local missing_deps=()
     
-    for dep in "${deps[@]}"; do
-        if ! command -v "$dep" &> /dev/null && ! dpkg -l | grep -q "^ii.*$dep"; then
+    # Check command dependencies
+    for dep in "${command_deps[@]}"; do
+        if ! command -v "$dep" &> /dev/null; then
             missing_deps+=("$dep")
         fi
     done
+    
+    # Check library dependencies (Ubuntu/Debian packages)
+    if command -v dpkg &> /dev/null; then
+        for dep in "${library_deps[@]}"; do
+            if ! dpkg -l "$dep" 2>/dev/null | grep -q "^ii"; then
+                missing_deps+=("$dep")
+            fi
+        done
+    else
+        # If not on Debian/Ubuntu, assume libraries are available
+        print_warning "Cannot check library dependencies on non-Debian system"
+    fi
     
     # Check for ISO creation tools
     if ! command -v genisoimage &> /dev/null && ! command -v mkisofs &> /dev/null; then
@@ -106,6 +126,7 @@ build_kernel() {
     local kernel_config="${SCRIPT_DIR}/working-kernel-config"
     local kernel_patch="${SCRIPT_DIR}/enable-ubuntu-features.patch"
     local rebuild_kernel=false
+    local skip_deps=false
     
     # Parse build-kernel arguments
     while [[ $# -gt 0 ]]; do
@@ -113,6 +134,7 @@ build_kernel() {
             --config) kernel_config="$2"; shift 2 ;;
             --rebuild-kernel) rebuild_kernel=true; shift ;;
             --rebuild) rebuild_kernel=true; shift ;;  # Alternative flag
+            --skip-deps) skip_deps=true; shift ;;
             *) print_error "Unknown build-kernel option: $1"; exit 1 ;;
         esac
     done
@@ -207,12 +229,14 @@ build_kernel() {
 # Build Ubuntu 24.04 runner filesystem with all packages
 build_filesystem() {
     local rebuild_fs=false
+    local skip_deps=false
     
     # Parse build-fs arguments
     while [[ $# -gt 0 ]]; do
         case $1 in
             --rebuild-fs) rebuild_fs=true; shift ;;
             --rebuild) rebuild_fs=true; shift ;;  # Alternative flag
+            --skip-deps) skip_deps=true; shift ;;
             *) print_error "Unknown build-fs option: $1"; exit 1 ;;
         esac
     done
@@ -459,6 +483,7 @@ launch_vm() {
             --cpus) VM_CPUS="$2"; shift 2 ;;
             --kernel) custom_kernel="$2"; shift 2 ;;
             --no-cloud-init) use_cloud_init=false; shift ;;
+            --skip-deps) skip_deps=true; shift ;;
             *) print_error "Unknown option: $1"; exit 1 ;;
         esac
     done
@@ -834,10 +859,12 @@ usage() {
     echo "  --config <path>           Custom kernel config file (default: working-kernel-config)"
     echo "  --rebuild-kernel          Force rebuild even if kernel exists"
     echo "  --rebuild                 Same as --rebuild-kernel"
+    echo "  --skip-deps               Skip dependency checks"
     echo ""
     echo "Build-FS Options:"
     echo "  --rebuild-fs              Force rebuild even if filesystem exists"
     echo "  --rebuild                 Same as --rebuild-fs"
+    echo "  --skip-deps               Skip dependency checks"
     echo ""
     echo "Launch Options:"
     echo "  --snapshot <name>         Use specific snapshot"
@@ -849,15 +876,19 @@ usage() {
     echo "  --cpus <count>            VM CPU count (default: 2)"
     echo "  --kernel <path>           Custom kernel path"
     echo "  --no-cloud-init           Disable cloud-init"
+    echo "  --skip-deps               Skip dependency checks"
     echo ""
     echo "Examples:"
     echo "  $0 build-kernel                    # Build kernel with default config"
     echo "  $0 build-kernel --config my.config # Build kernel with custom config"
     echo "  $0 build-kernel --rebuild-kernel   # Force rebuild kernel"
+    echo "  $0 build-kernel --skip-deps        # Build without dependency checks"
     echo "  $0 build-fs                        # Build filesystem"
     echo "  $0 build-fs --rebuild-fs           # Force rebuild filesystem"
+    echo "  $0 build-fs --skip-deps            # Build without dependency checks"
     echo "  $0 snapshot prod-v1                # Create production snapshot"
     echo "  $0 launch --github-url https://github.com/org/repo --github-token ghp_xxx"
+    echo "  $0 launch --skip-deps --no-cloud-init --name test  # Quick test"
     echo "  $0 list                            # Show all resources"
     echo "  $0 cleanup                         # Stop everything"
 }
@@ -865,6 +896,13 @@ usage() {
 # Main function
 main() {
     local cmd="${1:-help}"
+    local skip_deps_global=false
+    
+    # Check for global --skip-deps flag
+    if [[ "$*" =~ --skip-deps ]]; then
+        skip_deps_global=true
+    fi
+    
     shift || true
     
     # Show banner for main commands (not for help/version)
@@ -875,13 +913,21 @@ main() {
     case "$cmd" in
         build-kernel)
             check_os
-            check_dependencies
+            if [ "$skip_deps_global" = false ]; then
+                check_dependencies
+            else
+                print_warning "Skipping dependency checks (--skip-deps specified)"
+            fi
             setup_workspace
             build_kernel "$@"
             ;;
         build-fs)
             check_os
-            check_dependencies  
+            if [ "$skip_deps_global" = false ]; then
+                check_dependencies
+            else
+                print_warning "Skipping dependency checks (--skip-deps specified)"
+            fi
             setup_workspace
             build_filesystem "$@"
             ;;
@@ -892,7 +938,11 @@ main() {
             ;;
         launch)
             check_os
-            check_dependencies
+            if [ "$skip_deps_global" = false ]; then
+                check_dependencies
+            else
+                print_warning "Skipping dependency checks (--skip-deps specified)"
+            fi
             setup_workspace
             launch_vm "$@"
             ;;

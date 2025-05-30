@@ -77,12 +77,14 @@ firecracker-poc/
 --config <path>        # Custom kernel config (default: working-kernel-config)
 --rebuild-kernel       # Force rebuild even if kernel exists
 --rebuild              # Same as --rebuild-kernel
+--skip-deps            # Skip dependency checks
 ```
 
 ### Filesystem Building  
 ```bash
 --rebuild-fs           # Force rebuild even if filesystem exists
 --rebuild              # Same as --rebuild-fs
+--skip-deps            # Skip dependency checks
 ```
 
 ## 🎛️ Launch Options
@@ -190,6 +192,16 @@ for i in {1..5}; do
     --github-token "$GITHUB_TOKEN" \
     --labels "production,cluster-$i" &
 done
+
+# Skip dependency checks (if you know everything is installed)
+./firecracker-complete.sh build-kernel --skip-deps
+./firecracker-complete.sh build-fs --skip-deps
+
+# Alternative: Use environment variable to skip all dependency checks
+export SKIP_DEPS=true
+./firecracker-complete.sh build-kernel
+./firecracker-complete.sh build-fs
+./firecracker-complete.sh launch --github-url "$GITHUB_URL" --github-token "$GITHUB_TOKEN"
 ```
 
 ### Resource Management
