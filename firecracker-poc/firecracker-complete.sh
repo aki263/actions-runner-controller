@@ -542,8 +542,11 @@ EOF
     
     sudo chmod +x "${mount_dir}/usr/local/bin/setup-runner.sh"
     
+    # Create ARC integration scripts for webhook handling and status reporting
+    print_info "Creating ARC integration scripts..."
+    
     # Enable services
-    sudo chroot "${mount_dir}" systemctl enable ssh docker systemd-networkd
+    sudo chroot "${mount_dir}" systemctl enable ssh docker systemd-networkd github-runner
     
     # Install additional tools from ubuntu-24-packages.md
     print_info "Installing additional development tools..."
@@ -683,6 +686,11 @@ launch_vm() {
     local custom_kernel=""
     local use_host_bridge=false
     local use_dhcp=false
+    local docker_mode=false
+    local skip_deps=false
+    local arc_mode=false
+    local arc_controller_url=""
+    local ephemeral_mode=false
     
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -697,7 +705,11 @@ launch_vm() {
             --kernel) custom_kernel="$2"; shift 2 ;;
             --no-cloud-init) use_cloud_init=false; shift ;;
             --use-host-bridge) use_host_bridge=true; shift ;;
+            --docker-mode) docker_mode=true; shift ;;
             --skip-deps) skip_deps=true; shift ;;
+            --arc-mode) arc_mode=true; shift ;;
+            --arc-controller-url) arc_controller_url="$2"; shift 2 ;;
+            --ephemeral-mode) ephemeral_mode=true; shift ;;
             *) print_error "Unknown option: $1"; exit 1 ;;
         esac
     done
@@ -871,6 +883,247 @@ launch_vm() {
       DNS=8.8.4.4"
         fi
         
+        # Create setup script content based on mode
+        local setup_script_content=""
+        if [ "$arc_mode" = true ]; then
+            setup_script_content="#!/bin/bash
+      set -euo pipefail
+      
+      # ARC-mode: Integrate with Actions Runner Controller
+      log() {
+          echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] \$1\" | tee -a /var/log/setup-runner.log
+      }
+      
+      # Report status to ARC controller
+      report_status() {
+          local status=\"\$1\"
+          local message=\"\$2\"
+          if [ -n \"${arc_controller_url}\" ]; then
+              curl -X POST \"${arc_controller_url}/api/v1/runners/${runner_name}/status\" \\
+                  -H \"Content-Type: application/json\" \\
+                  -d \"{\\\"status\\\": \\\"\$status\\\", \\\"message\\\": \\\"\$message\\\", \\\"timestamp\\\": \\\"\$(date -u +%Y-%m-%dT%H:%M:%SZ)\\\"}\" \\
+                  2>/dev/null || log \"Failed to report status to ARC controller\"
+          fi
+      }
+      
+      log \"=== ARC-Mode GitHub Actions Runner Setup ===\"
+      
+      # Report VM startup
+      report_status \"starting\" \"VM starting up\"
+      
+      # Wait for network connectivity
+      log \"Waiting for network connectivity...\"
+      for i in {1..30}; do
+          if curl -s --connect-timeout 3 https://api.github.com/zen >/dev/null; then
+              log \"Network connectivity confirmed\"
+              break
+          fi
+          if [ \$i -eq 30 ]; then
+              log \"ERROR: Network connectivity timeout\"
+              report_status \"failed\" \"Network connectivity timeout\"
+              exit 1
+          fi
+          sleep 2
+      done
+      
+      # Start Docker
+      log \"Starting Docker service...\"
+      systemctl start docker
+      sleep 5
+      usermod -aG docker runner
+      
+      # Configure runner
+      log \"Configuring GitHub Actions runner...\"
+      cd /opt/runner
+      
+      # Remove existing config
+      sudo -u runner ./config.sh remove --token \"${github_token}\" 2>/dev/null || true
+      
+      # Configure runner
+      sudo -u runner ./config.sh \\
+          --url \"${github_url}\" \\
+          --token \"${github_token}\" \\
+          --name \"${runner_name}\" \\
+          --labels \"${labels}\" \\
+          --work \"/tmp/runner-work\" \\
+          --unattended --replace
+      
+      report_status \"ready\" \"Runner configured and ready\"
+      
+      # Create job monitoring script
+      cat > /usr/local/bin/monitor-jobs.sh << 'MONITOR_EOF'
+#!/bin/bash
+RUNNER_PID=\"\"
+JOB_RUNNING=false
+LAST_JOB_TIME=\$(date +%s)
+
+# Function to check if runner is executing a job
+check_job_status() {
+    if pgrep -f \"Runner.Worker\" >/dev/null; then
+        if [ \"\$JOB_RUNNING\" = false ]; then
+            log \"Job started\"
+            report_status \"running\" \"Executing job\"
+            JOB_RUNNING=true
+        fi
+        LAST_JOB_TIME=\$(date +%s)
+    else
+        if [ \"\$JOB_RUNNING\" = true ]; then
+            log \"Job completed\"
+            report_status \"completed\" \"Job finished\"
+            JOB_RUNNING=false
+            
+            # If ephemeral mode, shutdown after job completion
+            if [ \"${ephemeral_mode}\" = \"true\" ]; then
+                log \"Ephemeral mode: Shutting down VM after job completion\"
+                report_status \"shutting_down\" \"VM shutting down (ephemeral mode)\"
+                sleep 5
+                shutdown -h now
+            fi
+        fi
+    fi
+}
+
+# Monitor runner process
+while true; do
+    check_job_status
+    
+    # Check if runner process is still alive
+    if ! pgrep -f \"actions.runner\" >/dev/null; then
+        log \"Runner process died, restarting...\"
+        report_status \"restarting\" \"Runner process died, restarting\"
+        systemctl restart github-runner
+        sleep 10
+    fi
+    
+    sleep 5
+done
+MONITOR_EOF
+      
+      chmod +x /usr/local/bin/monitor-jobs.sh
+      
+      # Start runner and monitoring
+      log \"Starting GitHub runner with ARC integration...\"
+      systemctl start github-runner
+      
+      # Start job monitoring in background
+      nohup /usr/local/bin/monitor-jobs.sh > /var/log/job-monitor.log 2>&1 &
+      
+      log \"=== ARC Setup Complete ===\""
+        elif [ "$docker_mode" = true ]; then
+            setup_script_content="#!/bin/bash
+      set -euo pipefail
+      
+      # Docker-mode: Run runner directly like in container
+      log() {
+          echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] \$1\" | tee -a /var/log/setup-runner.log
+      }
+      
+      log \"=== Docker-Mode GitHub Actions Runner Setup ===\"
+      
+      # Wait for network connectivity
+      log \"Waiting for network connectivity...\"
+      for i in {1..30}; do
+          if curl -s --connect-timeout 3 https://api.github.com/zen >/dev/null; then
+              log \"Network connectivity confirmed\"
+              break
+          fi
+          if [ \$i -eq 30 ]; then
+              log \"ERROR: Network connectivity timeout\"
+              exit 1
+          fi
+          sleep 2
+      done
+      
+      # Start Docker
+      log \"Starting Docker service...\"
+      systemctl start docker
+      sleep 5
+      
+      # Add runner user to docker group
+      usermod -aG docker runner
+      
+      # Configure and start runner in Docker mode
+      log \"Configuring runner in Docker mode...\"
+      cd /opt/runner
+      
+      # Remove existing config
+      sudo -u runner ./config.sh remove --token \"${github_token}\" 2>/dev/null || true
+      
+      # Configure runner
+      sudo -u runner ./config.sh \\
+          --url \"${github_url}\" \\
+          --token \"${github_token}\" \\
+          --name \"${runner_name}\" \\
+          --labels \"${labels}\" \\
+          --work \"/tmp/runner-work\" \\
+          --unattended --replace
+      
+      log \"Starting runner in foreground (Docker mode)...\"
+      # Start runner in foreground like Docker does
+      exec sudo -u runner ./run.sh"
+        else
+            setup_script_content="#!/bin/bash
+      set -euo pipefail
+
+      # Systemd-mode: Traditional service approach
+      log() {
+          echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] \$1\" | tee -a /var/log/setup-runner.log
+      }
+
+      log \"=== Systemd-Mode GitHub Actions Runner Setup ===\"
+
+      # Wait for network connectivity
+      log \"Waiting for network connectivity...\"
+      for i in {1..30}; do
+          if curl -s --connect-timeout 3 https://api.github.com/zen >/dev/null; then
+              log \"Network connectivity confirmed\"
+              break
+          fi
+          if [ \$i -eq 30 ]; then
+              log \"ERROR: Network connectivity timeout\"
+              exit 1
+          fi
+          sleep 2
+      done
+
+      # Start Docker
+      log \"Starting Docker service...\"
+      systemctl start docker
+      sleep 5
+
+      # Add runner user to docker group
+      usermod -aG docker runner
+
+      # Configure runner
+      log \"Configuring GitHub Actions runner...\"
+      cd /opt/runner
+
+      # Remove any existing configuration
+      if [ -f .runner ]; then
+          log \"Removing existing runner configuration...\"
+          sudo -u runner ./config.sh remove --token \"${github_token}\" || true
+      fi
+
+      # Create work directory
+      mkdir -p /tmp/runner-work
+      chown runner:runner /tmp/runner-work
+
+      log \"Running runner configuration...\"
+      sudo -u runner ./config.sh \\
+          --url \"${github_url}\" \\
+          --token \"${github_token}\" \\
+          --name \"${runner_name}\" \\
+          --labels \"${labels}\" \\
+          --work \"/tmp/runner-work\" \\
+          --unattended --replace
+
+      # Start systemd service
+      log \"Starting GitHub runner service...\"
+      systemctl start github-runner
+
+      log \"=== Setup Complete ===\""
+        fi
+        
         cat > cloud-init/user-data <<EOF
 #cloud-config
 hostname: ${runner_name}
@@ -889,6 +1142,10 @@ write_files:
       GITHUB_URL=${github_url}
       RUNNER_NAME=${runner_name}
       RUNNER_LABELS=${labels}
+  - path: /usr/local/bin/setup-runner.sh
+    permissions: '0755'
+    content: |
+${setup_script_content}
   - path: /usr/local/bin/run-with-env.sh
     permissions: '0755'
     content: |
@@ -904,7 +1161,7 @@ write_files:
 runcmd:
   - systemctl enable systemd-networkd
   - systemctl restart systemd-networkd
-  - /usr/local/bin/run-with-env.sh
+$(if [ "$arc_mode" = true ]; then echo "  - nohup /usr/local/bin/run-with-env.sh > /var/log/arc-runner.log 2>&1 &"; elif [ "$docker_mode" = true ]; then echo "  - nohup /usr/local/bin/run-with-env.sh > /var/log/docker-runner.log 2>&1 &"; else echo "  - /usr/local/bin/run-with-env.sh"; fi)
 
 ssh_pwauth: false
 EOF
@@ -1407,6 +1664,10 @@ usage() {
     echo "  --kernel <path>           Custom kernel path"
     echo "  --no-cloud-init           Disable cloud-init"
     echo "  --use-host-bridge         Use host bridge networking"
+    echo "  --docker-mode             Use Docker mode (run runner directly like container, not systemd)"
+    echo "  --arc-mode                Enable ARC integration with job lifecycle monitoring"
+    echo "  --arc-controller-url <url> ARC controller URL for status reporting"
+    echo "  --ephemeral-mode          Shutdown VM after job completion (for ARC)"
     echo "  --skip-deps               Skip dependency checks"
     echo ""
     echo "Examples:"
@@ -1418,8 +1679,9 @@ usage() {
     echo "  $0 build-fs --rebuild-fs           # Force rebuild filesystem"
     echo "  $0 build-fs --skip-deps            # Build without dependency checks"
     echo "  $0 snapshot prod-v1                # Create production snapshot"
-    echo "  $0 launch --github-url https://github.com/org/repo --github-token ghp_xxx"
     echo "  $0 launch --use-host-bridge --github-url https://github.com/org/repo --github-token ghp_xxx"
+    echo "  $0 launch --docker-mode --github-url https://github.com/org/repo --github-token ghp_xxx"
+    echo "  $0 launch --arc-mode --ephemeral-mode --arc-controller-url http://arc-controller:8080 --github-url https://github.com/org/repo --github-token ghp_xxx"
     echo "  $0 launch --skip-deps --no-cloud-init --name test  # Quick test"
     echo "  $0 list                            # Show all resources"
     echo "  $0 status                          # Check VM status and diagnostics"
