@@ -234,6 +234,118 @@ generate_random_mac() {
         $((RANDOM % 256)) $((RANDOM % 256)) $((RANDOM % 256)) $((RANDOM % 256)) $((RANDOM % 256))
 }
 
+# Generate short-lived registration token using GitHub API (like ARC does)
+generate_registration_token() {
+    local github_url="$1"
+    local github_pat="$2"
+    local runner_name="$3"
+    
+    # Validate GitHub URL format and extract components
+    local api_url=""
+    local scope=""
+    local target=""
+    
+    if [[ "$github_url" =~ ^https://github\.com/enterprises/([^/]+)/?$ ]]; then
+        # Enterprise URL
+        local enterprise="${BASH_REMATCH[1]}"
+        api_url="https://api.github.com/enterprises/${enterprise}/actions/runners/registration-token"
+        scope="enterprise"
+        target="$enterprise"
+    elif [[ "$github_url" =~ ^https://github\.com/([^/]+)/?$ ]]; then
+        # Organization URL
+        local org="${BASH_REMATCH[1]}"
+        api_url="https://api.github.com/orgs/${org}/actions/runners/registration-token"
+        scope="organization"
+        target="$org"
+    elif [[ "$github_url" =~ ^https://github\.com/([^/]+)/([^/]+)/?$ ]]; then
+        # Repository URL
+        local owner="${BASH_REMATCH[1]}"
+        local repo="${BASH_REMATCH[2]}"
+        api_url="https://api.github.com/repos/${owner}/${repo}/actions/runners/registration-token"
+        scope="repository"
+        target="$owner/$repo"
+    else
+        print_error "Invalid GitHub URL format: $github_url"
+        print_error "Expected: https://github.com/owner/repo, https://github.com/org, or https://github.com/enterprises/ent"
+        return 1
+    fi
+    
+    # Test basic API access first
+    if ! curl -s --fail -H "Authorization: Bearer $github_pat" \
+        https://api.github.com/user >/dev/null 2>&1; then
+        print_error "Failed to authenticate with GitHub API using provided PAT"
+        print_error "Check your PAT token and permissions"
+        return 1
+    fi
+    
+    # Generate registration token
+    local response
+    response=$(curl -s -w "%{http_code}" -X POST \
+        -H "Authorization: Bearer $github_pat" \
+        -H "Accept: application/vnd.github.v3+json" \
+        "$api_url" 2>/dev/null)
+    
+    local http_code="${response: -3}"
+    local body="${response%???}"
+    
+    case $http_code in
+        201)
+            # Parse JSON response
+            local token
+            token=$(echo "$body" | jq -r '.token' 2>/dev/null)
+            
+            if [ "$token" = "null" ] || [ -z "$token" ]; then
+                print_error "Failed to parse token from GitHub API response"
+                return 1
+            fi
+            
+            # Optional: Show token expiration info
+            local expires_at
+            expires_at=$(echo "$body" | jq -r '.expires_at' 2>/dev/null)
+            if [ "$expires_at" != "null" ] && [ -n "$expires_at" ]; then
+                print_info "Token expires at: $expires_at"
+            fi
+            
+            # Return the token
+            echo "$token"
+            return 0
+            ;;
+        401)
+            print_error "GitHub API authentication failed (401): PAT token is invalid or expired"
+            return 1
+            ;;
+        403)
+            print_error "GitHub API access forbidden (403): PAT token lacks required permissions for $scope runners"
+            print_error "Required permissions for $scope:"
+            case $scope in
+                repository)
+                    print_error "  • repo (full repository access) OR public_repo + admin:repo_hook (for public repos)"
+                    ;;
+                organization)
+                    print_error "  • admin:org (organization administration) + repo (repository access)"
+                    ;;
+                enterprise)
+                    print_error "  • admin:enterprise (enterprise administration)"
+                    ;;
+            esac
+            return 1
+            ;;
+        404)
+            print_error "GitHub API not found (404): $scope '$target' doesn't exist or PAT lacks access"
+            return 1
+            ;;
+        422)
+            print_error "GitHub API unprocessable entity (422): $scope may not support self-hosted runners"
+            return 1
+            ;;
+        *)
+            print_error "GitHub API unexpected response: $http_code"
+            print_error "Response: $body"
+            return 1
+            ;;
+    esac
+}
+
 # Build Ubuntu 24.04 runner filesystem with all packages
 build_filesystem() {
     local rebuild_fs=false
@@ -680,7 +792,8 @@ launch_vm() {
     local snapshot_name=""
     local runner_name="runner-$(date +%H%M%S)"
     local github_url=""
-    local github_token=""
+    local github_pat=""
+    local github_token=""  # For direct token override
     local labels="firecracker"
     local use_cloud_init=true
     local custom_kernel=""
@@ -698,7 +811,8 @@ launch_vm() {
             --snapshot) snapshot_name="$2"; shift 2 ;;
             --name) runner_name="$2"; shift 2 ;;
             --github-url) github_url="$2"; shift 2 ;;
-            --github-token) github_token="$2"; shift 2 ;;
+            --github-pat) github_pat="$2"; shift 2 ;;
+            --github-token) github_token="$2"; shift 2 ;;  # Direct token override (for backwards compatibility)
             --labels) labels="$2"; shift 2 ;;
             --memory) VM_MEMORY="$2"; shift 2 ;;
             --cpus) VM_CPUS="$2"; shift 2 ;;
@@ -714,7 +828,39 @@ launch_vm() {
         esac
     done
     
-    if [ "$use_cloud_init" = true ] && ([ -z "$github_url" ] || [ -z "$github_token" ]); then
+    # Generate registration token if needed
+    local final_github_token="$github_token"
+    if [ "$use_cloud_init" = true ]; then
+        if [ -z "$final_github_token" ]; then
+            if [ -z "$github_url" ] || [ -z "$github_pat" ]; then
+                print_error "GitHub URL and PAT are required to generate registration token"
+                print_error "Use: --github-url <url> --github-pat <pat>"
+                print_error "Or provide direct token: --github-token <token> (for testing)"
+                exit 1
+            fi
+            
+            print_info "Generating short-lived registration token..."
+            
+            # Generate registration token using the same logic as ARC
+            if ! command -v jq &> /dev/null; then
+                print_error "jq is required for token generation. Install with: sudo apt install jq"
+                exit 1
+            fi
+            
+            # Call the token generation logic
+            final_github_token=$(generate_registration_token "$github_url" "$github_pat" "$runner_name")
+            if [ $? -ne 0 ] || [ -z "$final_github_token" ]; then
+                print_error "Failed to generate registration token"
+                exit 1
+            fi
+            
+            print_info "✅ Registration token generated successfully"
+        else
+            print_warning "Using provided token directly (--github-token specified)"
+        fi
+    fi
+    
+    if [ "$use_cloud_init" = true ] && ([ -z "$github_url" ] || [ -z "$final_github_token" ]); then
         print_error "GitHub URL and token are required (or use --no-cloud-init for testing)"
         exit 1
     fi
@@ -951,12 +1097,12 @@ launch_vm() {
       cd /opt/runner
       
       # Remove existing config
-      sudo -u runner ./config.sh remove --token \"${github_token}\" 2>/dev/null || true
+      sudo -u runner ./config.sh remove --token \"${final_github_token}\" 2>/dev/null || true
       
       # Configure runner
       sudo -u runner ./config.sh \\
           --url \"${github_url}\" \\
-          --token \"${github_token}\" \\
+          --token \"${final_github_token}\" \\
           --name \"${runner_name}\" \\
           --labels \"${labels}\" \\
           --work \"/tmp/runner-work\" \\
@@ -1075,12 +1221,12 @@ MONITOR_EOF
       cd /opt/runner
       
       # Remove existing config
-      sudo -u runner ./config.sh remove --token \"${github_token}\" 2>/dev/null || true
+      sudo -u runner ./config.sh remove --token \"${final_github_token}\" 2>/dev/null || true
       
       # Configure runner
       sudo -u runner ./config.sh \\
           --url \"${github_url}\" \\
-          --token \"${github_token}\" \\
+          --token \"${final_github_token}\" \\
           --name \"${runner_name}\" \\
           --labels \"${labels}\" \\
           --work \"/tmp/runner-work\" \\
@@ -1129,7 +1275,7 @@ MONITOR_EOF
       # Remove any existing configuration
       if [ -f .runner ]; then
           log \"Removing existing runner configuration...\"
-          sudo -u runner ./config.sh remove --token \"${github_token}\" || true
+          sudo -u runner ./config.sh remove --token \"${final_github_token}\" || true
       fi
 
       # Create work directory
@@ -1139,7 +1285,7 @@ MONITOR_EOF
       log \"Running runner configuration...\"
       sudo -u runner ./config.sh \\
           --url \"${github_url}\" \\
-          --token \"${github_token}\" \\
+          --token \"${final_github_token}\" \\
           --name \"${runner_name}\" \\
           --labels \"${labels}\" \\
           --work \"/tmp/runner-work\" \\
@@ -1166,7 +1312,7 @@ users:
 write_files:
   - path: /etc/environment
     content: |
-      GITHUB_TOKEN=${github_token}
+      GITHUB_TOKEN=${final_github_token}
       GITHUB_URL=${github_url}
       RUNNER_NAME=${runner_name}
       RUNNER_LABELS=${labels}
@@ -1178,7 +1324,7 @@ $(echo "$setup_script_content" | sed 's/^/      /')
     permissions: '0755'
     content: |
       #!/bin/bash
-      export GITHUB_TOKEN="${github_token}"
+      export GITHUB_TOKEN="${final_github_token}"
       export GITHUB_URL="${github_url}"
       export RUNNER_NAME="${runner_name}"
       export RUNNER_LABELS="${labels}"
@@ -1804,7 +1950,8 @@ usage() {
     echo "  --snapshot <name>         Use specific snapshot"
     echo "  --name <name>             VM name"
     echo "  --github-url <url>        GitHub repo/org URL"
-    echo "  --github-token <token>    GitHub token"
+    echo "  --github-pat <pat>        GitHub personal access token (generates short-lived token)"
+    echo "  --github-token <token>    GitHub registration token (direct, for testing)"
     echo "  --labels <labels>         Runner labels"
     echo "  --memory <mb>             VM memory (default: 2048)" 
     echo "  --cpus <count>            VM CPU count (default: 2)"
@@ -1826,9 +1973,9 @@ usage() {
     echo "  $0 build-fs --rebuild-fs           # Force rebuild filesystem"
     echo "  $0 build-fs --skip-deps            # Build without dependency checks"
     echo "  $0 snapshot prod-v1                # Create production snapshot"
-    echo "  $0 launch --use-host-bridge --github-url https://github.com/org/repo --github-token ghp_xxx"
-    echo "  $0 launch --docker-mode --github-url https://github.com/org/repo --github-token ghp_xxx"
-    echo "  $0 launch --arc-mode --ephemeral-mode --arc-controller-url http://arc-controller:8080 --github-url https://github.com/org/repo --github-token ghp_xxx"
+    echo "  $0 launch --use-host-bridge --github-url https://github.com/org/repo --github-pat ghp_xxx"
+    echo "  $0 launch --docker-mode --github-url https://github.com/org/repo --github-pat ghp_xxx"
+    echo "  $0 launch --arc-mode --ephemeral-mode --arc-controller-url http://arc-controller:8080 --github-url https://github.com/org/repo --github-pat ghp_xxx"
     echo "  $0 launch --skip-deps --no-cloud-init --name test  # Quick test"
     echo "  $0 list                            # Show all resources"
     echo "  $0 status                          # Check VM status and diagnostics"
