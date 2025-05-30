@@ -898,11 +898,25 @@ launch_vm() {
       report_status() {
           local status=\"\$1\"
           local message=\"\$2\"
+          local timestamp=\"\$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+          
+          # Always log status locally
+          log \"STATUS: \$status - \$message\"
+          
           if [ -n \"${arc_controller_url}\" ]; then
-              curl -X POST \"${arc_controller_url}/api/v1/runners/${runner_name}/status\" \\
+              # Try to report to ARC controller
+              if curl -X POST \"${arc_controller_url}/api/v1/runners/${runner_name}/status\" \\
                   -H \"Content-Type: application/json\" \\
-                  -d \"{\\\"status\\\": \\\"\$status\\\", \\\"message\\\": \\\"\$message\\\", \\\"timestamp\\\": \\\"\$(date -u +%Y-%m-%dT%H:%M:%SZ)\\\"}\" \\
-                  2>/dev/null || log \"Failed to report status to ARC controller\"
+                  -d \"{\\\"status\\\": \\\"\$status\\\", \\\"message\\\": \\\"\$message\\\", \\\"timestamp\\\": \\\"\$timestamp\\\"}\" \\
+                  --connect-timeout 5 --max-time 10 >/dev/null 2>&1; then
+                  log \"✅ Status reported to ARC controller: \$status\"
+              else
+                  log \"⚠️  ARC controller unreachable - running in offline mode\"
+                  # Store status for later reporting
+                  echo \"\$timestamp|\$status|\$message\" >> /var/log/arc-status-offline.log
+              fi
+          else
+              log \"ℹ️  No ARC controller configured - status logged locally only\"
           fi
       }
       
@@ -976,6 +990,20 @@ check_job_status() {
             if [ \"${ephemeral_mode}\" = \"true\" ]; then
                 log \"Ephemeral mode: Shutting down VM after job completion\"
                 report_status \"shutting_down\" \"VM shutting down (ephemeral mode)\"
+                
+                # Create cleanup signal for host
+                echo \"job_completed:$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > /tmp/ephemeral-cleanup
+                
+                # Notify host to destroy VM (if possible)
+                if curl -X POST \"http://172.16.0.1:8081/vm/destroy\" \\
+                    -H \"Content-Type: application/json\" \\
+                    -d \"{\\\"vm_id\\\": \\\"$(hostname)\\\", \\\"reason\\\": \\\"job_completed\\\"}\" \\
+                    --connect-timeout 2 --max-time 5 2>/dev/null; then
+                    log \"Host notified for VM destruction\"
+                else
+                    log \"Host notification failed, proceeding with shutdown\"
+                fi
+                
                 sleep 5
                 shutdown -h now
             fi
@@ -1145,7 +1173,7 @@ write_files:
   - path: /usr/local/bin/setup-runner.sh
     permissions: '0755'
     content: |
-${setup_script_content}
+$(echo "$setup_script_content" | sed 's/^/      /')
   - path: /usr/local/bin/run-with-env.sh
     permissions: '0755'
     content: |
@@ -1263,7 +1291,11 @@ EOF
   "github_url": "$github_url",
   "labels": "$labels",
   "created": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-  "pid": $fc_pid
+  "pid": $fc_pid,
+  "ephemeral_mode": $ephemeral_mode,
+  "arc_mode": $arc_mode,
+  "arc_controller_url": "${arc_controller_url:-null}",
+  "docker_mode": $docker_mode
 }
 EOF
     
@@ -1585,6 +1617,120 @@ check_runner() {
     done
 }
 
+# Monitor and destroy ephemeral VMs when jobs complete
+monitor_ephemeral() {
+    print_header "Monitoring Ephemeral VMs"
+    
+    # Start simple HTTP server for VM destruction requests
+    start_destruction_server() {
+        print_info "Starting VM destruction server on port 8081..."
+        
+        while true; do
+            if command -v nc >/dev/null; then
+                echo -e "HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nVM_DESTROYED" | nc -l -p 8081 | while read -r line; do
+                    if echo "$line" | grep -q "POST /vm/destroy"; then
+                        # Extract VM ID from request (simplified)
+                        local vm_id=$(echo "$line" | grep -o '"vm_id":"[^"]*"' | cut -d'"' -f4)
+                        if [ -n "$vm_id" ]; then
+                            print_info "Destruction request for VM: $vm_id"
+                            destroy_vm "$vm_id"
+                        fi
+                    fi
+                done
+            else
+                print_warning "netcat not available for destruction server"
+                sleep 30
+            fi
+        done &
+        
+        echo $! > /tmp/destruction-server.pid
+        print_info "Destruction server started (PID: $(cat /tmp/destruction-server.pid))"
+    }
+    
+    # Destroy specific VM
+    destroy_vm() {
+        local vm_id="$1"
+        print_info "Destroying ephemeral VM: $vm_id"
+        
+        # Find the VM instance
+        local instance_dir=""
+        for inst in instances/*/info.json; do
+            if [ -f "$inst" ]; then
+                local name=$(jq -r '.vm_id // .name' "$inst" 2>/dev/null)
+                if [[ "$name" == *"$vm_id"* ]]; then
+                    instance_dir=$(dirname "$inst")
+                    break
+                fi
+            fi
+        done
+        
+        if [ -n "$instance_dir" ]; then
+            local pid=$(jq -r '.pid' "$instance_dir/info.json" 2>/dev/null)
+            local vm_name=$(jq -r '.name' "$instance_dir/info.json" 2>/dev/null)
+            
+            print_info "Stopping VM: $vm_name (PID: $pid)"
+            
+            # Kill Firecracker process
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                kill "$pid" 2>/dev/null || true
+                sleep 2
+                kill -9 "$pid" 2>/dev/null || true
+            fi
+            
+            # Cleanup instance directory
+            rm -rf "$instance_dir"
+            print_info "✅ VM $vm_name destroyed and cleaned up"
+        else
+            print_warning "VM instance not found: $vm_id"
+        fi
+    }
+    
+    # Monitor VMs for completion signals
+    monitor_completion_signals() {
+        print_info "Monitoring VMs for completion signals..."
+        
+        while true; do
+            for inst in instances/*/info.json; do
+                if [ -f "$inst" ]; then
+                    local instance_dir=$(dirname "$inst")
+                    local vm_name=$(jq -r '.name' "$inst" 2>/dev/null)
+                    local pid=$(jq -r '.pid' "$inst" 2>/dev/null)
+                    
+                    # Check if VM process is dead (indicating shutdown)
+                    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+                        print_info "Detected shutdown of ephemeral VM: $vm_name"
+                        destroy_vm "$vm_name"
+                    fi
+                    
+                    # Check for completion signal file (if VM is still running)
+                    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                        # Try to check completion signal via SSH (simplified check)
+                        local ip=$(jq -r '.ip' "$inst" 2>/dev/null)
+                        if [ "$ip" != "null" ] && [ -n "$ip" ]; then
+                            if ssh -i "$instance_dir/ssh_key" -o ConnectTimeout=2 -o StrictHostKeyChecking=no runner@"$ip" \
+                                '[ -f /tmp/ephemeral-cleanup ]' 2>/dev/null; then
+                                print_info "Job completion signal found for VM: $vm_name"
+                                # Give VM time to shutdown gracefully
+                                sleep 10
+                                if kill -0 "$pid" 2>/dev/null; then
+                                    print_info "Force destroying VM that didn't shutdown: $vm_name"
+                                    destroy_vm "$vm_name"
+                                fi
+                            fi
+                        fi
+                    fi
+                fi
+            done
+            
+            sleep 15
+        done
+    }
+    
+    # Start background services
+    start_destruction_server
+    monitor_completion_signals
+}
+
 # Cleanup everything  
 cleanup() {
     print_header "Cleaning Up"
@@ -1640,6 +1786,7 @@ usage() {
     echo "  stop [pattern]            Stop VMs (optional regex pattern)" 
     echo "  status                    Check VM status and diagnostics"
     echo "  check-runner              Check GitHub runner status"
+    echo "  monitor-ephemeral         Monitor and cleanup ephemeral VMs"
     echo "  cleanup                   Stop all VMs and cleanup"
     echo ""
     echo "Build-Kernel Options:"
@@ -1686,6 +1833,7 @@ usage() {
     echo "  $0 list                            # Show all resources"
     echo "  $0 status                          # Check VM status and diagnostics"
     echo "  $0 check-runner                    # Check if GitHub runner is working"
+    echo "  $0 monitor-ephemeral               # Monitor and cleanup ephemeral VMs"
     echo "  $0 cleanup                         # Stop everything"
 }
 
@@ -1757,6 +1905,10 @@ main() {
         check-runner)
             setup_workspace
             check_runner "$@"
+            ;;
+        monitor-ephemeral)
+            setup_workspace
+            monitor_ephemeral
             ;;
         cleanup)
             setup_workspace
