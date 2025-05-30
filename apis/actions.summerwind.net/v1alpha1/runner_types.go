@@ -79,6 +79,10 @@ type RunnerConfig struct {
 	// +optional
 	ContainerMode string `json:"containerMode,omitempty"`
 
+	// Runtime configuration for the runner (Firecracker, container, etc.)
+	// +optional
+	Runtime *RuntimeConfig `json:"runtime,omitempty"`
+
 	GitHubAPICredentialsFrom *GitHubAPICredentialsFrom `json:"githubAPICredentialsFrom,omitempty"`
 }
 
@@ -88,6 +92,116 @@ type GitHubAPICredentialsFrom struct {
 
 type SecretReference struct {
 	Name string `json:"name"`
+}
+
+// FirecrackerRuntime defines the configuration for Firecracker VM runtime
+type FirecrackerRuntime struct {
+	// KernelImagePath is the path to the kernel image to use for Firecracker VMs
+	// +optional
+	KernelImagePath string `json:"kernelImagePath,omitempty"`
+
+	// RootfsImagePath is the path to the root filesystem image to use for Firecracker VMs
+	// +optional  
+	RootfsImagePath string `json:"rootfsImagePath,omitempty"`
+
+	// SnapshotName is the name of the snapshot to use instead of RootfsImagePath
+	// +optional
+	SnapshotName string `json:"snapshotName,omitempty"`
+
+	// MemoryMiB is the amount of memory in MiB to allocate to the VM
+	// +optional
+	// +kubebuilder:default=2048
+	MemoryMiB int `json:"memoryMiB,omitempty"`
+
+	// VCPUs is the number of virtual CPUs to allocate to the VM
+	// +optional
+	// +kubebuilder:default=2
+	VCPUs int `json:"vcpus,omitempty"`
+
+	// NetworkConfig defines the network configuration for the VM
+	// +optional
+	NetworkConfig *FirecrackerNetworkConfig `json:"networkConfig,omitempty"`
+
+	// EphemeralMode indicates if the VM should be destroyed after job completion
+	// +optional
+	EphemeralMode bool `json:"ephemeralMode,omitempty"`
+
+	// UseHostBridge indicates if the VM should use host bridge networking instead of static IPs
+	// +optional
+	UseHostBridge bool `json:"useHostBridge,omitempty"`
+
+	// DockerMode indicates if the runner should run directly like a container (not as systemd service)
+	// +optional
+	DockerMode bool `json:"dockerMode,omitempty"`
+
+	// ARCMode enables ARC integration with job lifecycle monitoring
+	// +optional
+	ARCMode bool `json:"arcMode,omitempty"`
+
+	// ARCControllerURL is the URL for ARC controller status reporting
+	// +optional
+	ARCControllerURL string `json:"arcControllerURL,omitempty"`
+}
+
+// FirecrackerNetworkConfig defines network configuration for Firecracker VMs
+type FirecrackerNetworkConfig struct {
+	// Interface is the network interface name inside the VM (usually eth0)
+	// +optional
+	// +kubebuilder:default="eth0"
+	Interface string `json:"interface,omitempty"`
+
+	// SubnetCIDR is the subnet CIDR for static IP assignment
+	// +optional
+	// +kubebuilder:default="172.16.0.0/24"
+	SubnetCIDR string `json:"subnetCIDR,omitempty"`
+
+	// Gateway is the gateway IP for static IP assignment
+	// +optional
+	// +kubebuilder:default="172.16.0.1"
+	Gateway string `json:"gateway,omitempty"`
+
+	// BridgeName is the bridge device name on the host
+	// +optional
+	// +kubebuilder:default="fc-br0"
+	BridgeName string `json:"bridgeName,omitempty"`
+
+	// TAPDeviceName is the TAP device name on the host
+	// +optional
+	// +kubebuilder:default="fc-tap0"
+	TAPDeviceName string `json:"tapDeviceName,omitempty"`
+
+	// NetworkMode defines the networking approach (bridge, macvlan, host, nat)
+	// +optional
+	// +kubebuilder:default="bridge"
+	// +kubebuilder:validation:Enum=bridge;macvlan;host;nat
+	NetworkMode string `json:"networkMode,omitempty"`
+
+	// ParentInterface is the host interface to use for macvlan or nat modes
+	// +optional
+	ParentInterface string `json:"parentInterface,omitempty"`
+
+	// MacvlanMode defines the macvlan mode (bridge, vepa, private, passthru)
+	// +optional
+	// +kubebuilder:default="bridge"
+	// +kubebuilder:validation:Enum=bridge;vepa;private;passthru
+	MacvlanMode string `json:"macvlanMode,omitempty"`
+
+	// DHCPEnabled indicates if the VM should use DHCP instead of static IP
+	// +optional
+	DHCPEnabled bool `json:"dhcpEnabled,omitempty"`
+}
+
+// RuntimeConfig defines the runtime configuration for runners (Firecracker, containers, etc.)
+type RuntimeConfig struct {
+	// Type specifies the runtime type (firecracker, container)
+	// +optional
+	// +kubebuilder:default="container"
+	// +kubebuilder:validation:Enum=container;firecracker
+	Type string `json:"type,omitempty"`
+
+	// Firecracker contains Firecracker-specific runtime configuration
+	// +optional
+	Firecracker *FirecrackerRuntime `json:"firecracker,omitempty"`
 }
 
 // RunnerPodSpec defines the desired pod spec fields of the runner pod

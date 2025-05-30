@@ -32,6 +32,7 @@ import (
 
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -73,7 +74,8 @@ type RunnerReconciler struct {
 	RegistrationRecheckJitter   time.Duration
 	UnregistrationRetryDelay    time.Duration
 
-	RunnerPodDefaults RunnerPodDefaults
+	RunnerPodDefaults    RunnerPodDefaults
+	FirecrackerVMManager *FirecrackerVMManager
 }
 
 type RunnerPodDefaults struct {
@@ -123,6 +125,13 @@ func (r *RunnerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 	} else {
 		// Request to remove a runner. DeletionTimestamp was set in the runner - we need to unregister runner
+		if runner.Spec.Runtime != nil && runner.Spec.Runtime.Type == "firecracker" {
+			// Firecracker VM deletion - no pod to check
+			r.GitHubClient.DeinitForRunner(&runner)
+			return r.processRunnerDeletion(runner, ctx, log, nil)
+		}
+
+		// Container-based runner deletion - check for pod
 		var pod corev1.Pod
 		if err := r.Get(ctx, req.NamespacedName, &pod); err != nil {
 			if !kerrors.IsNotFound(err) {
@@ -134,14 +143,76 @@ func (r *RunnerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 
 		r.GitHubClient.DeinitForRunner(&runner)
-
 		return r.processRunnerDeletion(runner, ctx, log, &pod)
 	}
 
+	// Handle Firecracker VM status
+	if runner.Spec.Runtime != nil && runner.Spec.Runtime.Type == "firecracker" {
+		return r.handleFirecrackerRunnerStatus(ctx, runner, log)
+	}
+
+	// Handle container-based runner status
+	return r.handleContainerRunnerStatus(ctx, runner, log)
+}
+
+func (r *RunnerReconciler) handleFirecrackerRunnerStatus(ctx context.Context, runner v1alpha1.Runner, log logr.Logger) (ctrl.Result, error) {
+	// Check if VM exists and get status
+	if r.FirecrackerVMManager == nil {
+		// VM Manager not configured, create runner if needed
+		return r.processRunnerCreation(ctx, runner, log)
+	}
+
+	vmInfo, err := r.FirecrackerVMManager.GetVMStatus(ctx, &runner)
+	if err != nil {
+		// VM doesn't exist yet, create it
+		log.V(1).Info("VM not found, creating", "error", err)
+		return r.processRunnerCreation(ctx, runner, log)
+	}
+
+	// Determine VM status
+	var phase string
+	var ready bool
+	var reason, message string
+
+	if vmInfo.PID > 0 {
+		// VM process is running
+		phase = "Running"
+		ready = true
+		reason = "VMRunning"
+		message = fmt.Sprintf("Firecracker VM running with PID %d on IP %s", vmInfo.PID, vmInfo.IP)
+	} else {
+		// VM process is not running
+		phase = "Failed"
+		ready = false
+		reason = "VMStopped"
+		message = "Firecracker VM process has stopped"
+	}
+
+	// Update runner status if changed
+	if runner.Status.Phase != phase || runner.Status.Ready != ready {
+		updated := runner.DeepCopy()
+		updated.Status.Phase = phase
+		updated.Status.Ready = ready
+		updated.Status.Reason = reason
+		updated.Status.Message = message
+
+		if err := r.Status().Patch(ctx, updated, client.MergeFrom(&runner)); err != nil {
+			log.Error(err, "Failed to update runner status for Firecracker VM")
+			return ctrl.Result{}, err
+		}
+
+		log.V(1).Info("Updated Firecracker runner status", "phase", phase, "ready", ready)
+	}
+
+	// Requeue to check VM status periodically
+	return ctrl.Result{RequeueAfter: time.Minute}, nil
+}
+
+func (r *RunnerReconciler) handleContainerRunnerStatus(ctx context.Context, runner v1alpha1.Runner, log logr.Logger) (ctrl.Result, error) {
 	var pod corev1.Pod
-	if err := r.Get(ctx, req.NamespacedName, &pod); err != nil {
+	if err := r.Get(ctx, types.NamespacedName{Name: runner.Name, Namespace: runner.Namespace}, &pod); err != nil {
 		if !kerrors.IsNotFound(err) {
-			// An error ocurred
+			// An error occurred
 			return ctrl.Result{}, err
 		}
 		return r.processRunnerCreation(ctx, runner, log)
@@ -271,6 +342,20 @@ func ephemeralRunnerContainerStatus(pod *corev1.Pod) *corev1.ContainerStatus {
 }
 
 func (r *RunnerReconciler) processRunnerDeletion(runner v1alpha1.Runner, ctx context.Context, log logr.Logger, pod *corev1.Pod) (reconcile.Result, error) {
+	// Handle Firecracker VM cleanup if this is a Firecracker runner
+	if runner.Spec.Runtime != nil && runner.Spec.Runtime.Type == "firecracker" {
+		if r.FirecrackerVMManager != nil {
+			log.Info("Cleaning up Firecracker VM", "runner", runner.Name)
+			if err := r.FirecrackerVMManager.DeleteVM(ctx, &runner); err != nil {
+				log.Error(err, "Failed to cleanup Firecracker VM")
+				// Don't fail deletion for cleanup errors, just log them
+			} else {
+				log.Info("Successfully cleaned up Firecracker VM", "runner", runner.Name)
+				r.Recorder.Event(&runner, corev1.EventTypeNormal, "VMDeleted", "Firecracker VM cleaned up")
+			}
+		}
+	}
+
 	finalizers, removed := removeFinalizer(runner.ObjectMeta.Finalizers, finalizerName)
 
 	if removed {
@@ -295,6 +380,45 @@ func (r *RunnerReconciler) processRunnerCreation(ctx context.Context, runner v1a
 		return ctrl.Result{Requeue: true}, nil
 	}
 
+	// Check if this runner should use Firecracker VMs
+	if runner.Spec.Runtime != nil && runner.Spec.Runtime.Type == "firecracker" {
+		return r.processFirecrackerRunnerCreation(ctx, runner, log)
+	}
+
+	// Default container-based runner creation
+	return r.processContainerRunnerCreation(ctx, runner, log)
+}
+
+func (r *RunnerReconciler) processFirecrackerRunnerCreation(ctx context.Context, runner v1alpha1.Runner, log logr.Logger) (reconcile.Result, error) {
+	if r.FirecrackerVMManager == nil {
+		log.Error(fmt.Errorf("Firecracker VM manager not configured"), "Cannot create Firecracker runner")
+		return ctrl.Result{}, fmt.Errorf("Firecracker VM manager not configured")
+	}
+
+	// Get registration token from runner status
+	registrationToken := runner.Status.Registration.Token
+	if registrationToken == "" {
+		log.Error(fmt.Errorf("registration token missing"), "Cannot create Firecracker VM without registration token")
+		return ctrl.Result{RequeueAfter: time.Second * 30}, nil
+	}
+
+	log.Info("Creating Firecracker VM for runner", "runtime", runner.Spec.Runtime.Type)
+
+	// Create the Firecracker VM
+	vmInfo, err := r.FirecrackerVMManager.CreateVM(ctx, &runner, registrationToken)
+	if err != nil {
+		log.Error(err, "Failed to create Firecracker VM")
+		r.Recorder.Event(&runner, corev1.EventTypeWarning, "VMCreationFailed", fmt.Sprintf("Failed to create Firecracker VM: %v", err))
+		return ctrl.Result{RequeueAfter: time.Minute}, err
+	}
+
+	r.Recorder.Event(&runner, corev1.EventTypeNormal, "VMCreated", fmt.Sprintf("Created Firecracker VM '%s' with IP %s", vmInfo.VMID, vmInfo.IP))
+	log.Info("Created Firecracker VM", "vmID", vmInfo.VMID, "ip", vmInfo.IP, "pid", vmInfo.PID)
+
+	return ctrl.Result{}, nil
+}
+
+func (r *RunnerReconciler) processContainerRunnerCreation(ctx context.Context, runner v1alpha1.Runner, log logr.Logger) (reconcile.Result, error) {
 	newPod, err := r.newPod(runner)
 	if err != nil {
 		log.Error(err, "Could not create pod")
@@ -1208,8 +1332,6 @@ func newRunnerPodWithContainerMode(containerMode string, template corev1.Pod, ru
 			//     link/ether 02:42:ab:1c:83:69 brd ff:ff:ff:ff:ff:ff
 			// 4: br-c5bf6c172bd7: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc noqueue state DOWN
 			//     link/ether 02:42:e2:91:13:1e brd ff:ff:ff:ff:ff:ff
-			// 8: veth767f1a5@if7: <BROADCAST,MULTICAST,UP,LOWER_UP,M-DOWN> mtu 1400 qdisc noqueue master docker0 state UP
-			//     link/ether 82:d5:08:28:d8:98 brd ff:ff:ff:ff:ff:ff
 			//
 			// # After 10 seconds sleep, you can see the container stops and the veth767f1a5@if7 interface got deleted:
 			//

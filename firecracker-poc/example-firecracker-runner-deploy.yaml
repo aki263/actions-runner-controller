@@ -1,0 +1,259 @@
+apiVersion: actions.summerwind.dev/v1alpha1
+kind: RunnerDeployment
+metadata:
+  name: firecracker-runners
+  namespace: actions-runner-system
+spec:
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        app: firecracker-runner
+    spec:
+      organization: your-org  # Change to your GitHub org
+      labels:
+        - firecracker
+        - ubuntu-24.04
+        - self-hosted
+      
+      # Firecracker Runtime Configuration
+      runtime:
+        type: firecracker
+        firecracker:
+          # Snapshot configuration (preferred)
+          snapshotName: "prod-runner-v1"
+          
+          # kernelImagePath: "/opt/firecracker/kernels/vmlinux-6.1.128-ubuntu24"
+          # rootfsImagePath: "/opt/firecracker/images/actions-runner-ubuntu-24.04.ext4"
+          
+          memoryMiB: 4096
+          vcpus: 4
+          
+          # Network Configuration
+          networkConfig:
+            interface: "eth0"
+            subnetCIDR: "172.16.0.0/24"
+            gateway: "172.16.0.1"
+            bridgeName: "fc-br0"
+            tapDeviceName: "fc-tap0"
+          
+          # Runtime Options
+          ephemeralMode: true      # Destroy VM after job completion
+          useHostBridge: false     # Use static IPs (false) or host bridge DHCP (true)
+          dockerMode: false        # Use systemd service (false) or direct runner (true)
+          arcMode: true           # Enable ARC integration
+          arcControllerURL: "http://172.16.0.1:30080"  # ARC controller endpoint
+      
+      # GitHub API Credentials (same as regular runners)
+      githubAPICredentialsFrom:
+        secretRef:
+          name: github-app-secret
+---
+apiVersion: actions.summerwind.dev/v1alpha1
+kind: RunnerDeployment
+metadata:
+  name: firecracker-host-bridge-runners
+  namespace: actions-runner-system
+spec:
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        app: firecracker-runner-dhcp
+    spec:
+      repository: your-org/your-repo  # Change to your GitHub repo
+      labels:
+        - firecracker
+        - ubuntu-24.04
+        - host-bridge
+      
+      # Firecracker Runtime with Host Bridge Networking
+      runtime:
+        type: firecracker
+        firecracker:
+          snapshotName: "prod-runner-v1"
+          memoryMiB: 2048
+          vcpus: 2
+          
+          # Use host bridge for networking (DHCP)
+          useHostBridge: true
+          networkConfig:
+            bridgeName: "br0"  # Assumes host has br0 bridge
+          
+          # Standard ARC integration
+          ephemeralMode: true
+          arcMode: true
+          arcControllerURL: "http://192.168.1.100:30080"  # Use actual host IP
+      
+      githubAPICredentialsFrom:
+        secretRef:
+          name: github-app-secret
+---
+apiVersion: actions.summerwind.dev/v1alpha1
+kind: RunnerDeployment
+metadata:
+  name: firecracker-docker-mode-runners
+  namespace: actions-runner-system
+spec:
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: firecracker-docker-runner
+    spec:
+      enterprise: your-enterprise  # Change to your GitHub enterprise
+      labels:
+        - firecracker
+        - ubuntu-24.04
+        - docker-mode
+      
+      # Firecracker Runtime in Docker Mode
+      runtime:
+        type: firecracker
+        firecracker:
+          # Use direct paths instead of snapshot
+          kernelImagePath: "/opt/firecracker/kernels/vmlinux-6.1.128-ubuntu24"
+          rootfsImagePath: "/opt/firecracker/images/actions-runner-ubuntu-24.04.ext4"
+          
+          memoryMiB: 8192
+          vcpus: 8
+          
+          # Docker-like behavior
+          dockerMode: true      # Run runner directly (not as systemd service)
+          ephemeralMode: false  # Keep running for multiple jobs
+          arcMode: false       # Disable ARC integration for this use case
+          
+          networkConfig:
+            subnetCIDR: "172.20.0.0/24"
+            gateway: "172.20.0.1"
+            bridgeName: "fc-br1"
+            tapDeviceName: "fc-tap1"
+      
+      githubAPICredentialsFrom:
+        secretRef:
+          name: github-enterprise-secret
+---
+# Bridge-less Networking Examples
+# These examples show how to avoid creating bridges and use your existing eth0/eth1 interfaces
+
+apiVersion: actions.summerwind.dev/v1alpha1
+kind: RunnerDeployment
+metadata:
+  name: firecracker-macvlan-runners
+  namespace: actions-runner-system
+spec:
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        app: firecracker-macvlan
+    spec:
+      organization: your-org
+      labels:
+        - firecracker
+        - macvlan
+        - no-bridge
+      
+      # Macvlan Networking - No bridges needed!
+      runtime:
+        type: firecracker
+        firecracker:
+          snapshotName: "prod-runner-v1"
+          memoryMiB: 2048
+          vcpus: 2
+          
+          networkConfig:
+            networkMode: "macvlan"           # Use macvlan instead of bridge
+            parentInterface: "eth0"          # Use your existing eth0
+            macvlanMode: "bridge"            # bridge, vepa, private, passthru
+            dhcpEnabled: true                # Get IP from your network's DHCP
+            # OR use static IP:
+            # dhcpEnabled: false
+            # subnetCIDR: "192.168.1.0/24"
+            # gateway: "192.168.1.1"
+          
+          ephemeralMode: true
+          arcMode: true
+          arcControllerURL: "http://192.168.1.100:30080"  # Use your actual host IP
+      
+      githubAPICredentialsFrom:
+        secretRef:
+          name: github-app-secret
+---
+apiVersion: actions.summerwind.dev/v1alpha1
+kind: RunnerDeployment
+metadata:
+  name: firecracker-nat-runners
+  namespace: actions-runner-system
+spec:
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        app: firecracker-nat
+    spec:
+      repository: your-org/your-repo
+      labels:
+        - firecracker
+        - nat
+        - isolated
+      
+      # NAT Networking - Isolated VMs with internet access via your eth1
+      runtime:
+        type: firecracker
+        firecracker:
+          snapshotName: "prod-runner-v1"
+          memoryMiB: 2048
+          vcpus: 2
+          
+          networkConfig:
+            networkMode: "nat"               # NAT mode for isolation
+            parentInterface: "eth1"          # Route through your eth1
+            subnetCIDR: "10.0.100.0/24"     # Private VM network
+            gateway: "10.0.100.1"           # Gateway IP
+          
+          ephemeralMode: true
+          arcMode: true
+          arcControllerURL: "http://10.0.100.1:30080"
+      
+      githubAPICredentialsFrom:
+        secretRef:
+          name: github-app-secret
+---
+apiVersion: actions.summerwind.dev/v1alpha1
+kind: RunnerDeployment
+metadata:
+  name: firecracker-host-network-runners
+  namespace: actions-runner-system
+spec:
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: firecracker-host-network
+    spec:
+      organization: your-org
+      labels:
+        - firecracker
+        - host-network
+        - simple
+      
+      # Host Networking - Simplest setup, VMs share host network
+      runtime:
+        type: firecracker
+        firecracker:
+          snapshotName: "prod-runner-v1"
+          memoryMiB: 4096
+          vcpus: 4
+          
+          networkConfig:
+            networkMode: "host"             # Share host network namespace
+          
+          ephemeralMode: true
+          arcMode: true
+          # Use localhost since VM shares host network
+          arcControllerURL: "http://localhost:30080"
+      
+      githubAPICredentialsFrom:
+        secretRef:
+          name: github-app-secret 
