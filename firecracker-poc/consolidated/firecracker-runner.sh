@@ -433,15 +433,15 @@ launch_vm() {
 hostname: ${runner_name}
 
 # Network configuration (DHCP)
-network:
-  version: 2
-  ethernets:
-    eth0:
-      dhcp4: true
-      nameservers:
-        addresses:
-          - 8.8.8.8
-          - 8.8.4.4
+# network:
+#   version: 2
+#   ethernets:
+#     eth0:
+#       dhcp4: true
+#       nameservers:
+#         addresses:
+#           - 8.8.8.8
+#           - 8.8.4.4
 
 users:
   - name: runner
