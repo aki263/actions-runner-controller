@@ -103,25 +103,48 @@ setup_workspace() {
 
 # Build custom kernel with Ubuntu 24.04 package support
 build_kernel() {
-    local kernel_config="${1:-${SCRIPT_DIR}/working-kernel-config}"
+    local kernel_config="${SCRIPT_DIR}/working-kernel-config"
     local kernel_patch="${SCRIPT_DIR}/enable-ubuntu-features.patch"
+    local rebuild_kernel=false
+    
+    # Parse build-kernel arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --config) kernel_config="$2"; shift 2 ;;
+            --rebuild-kernel) rebuild_kernel=true; shift ;;
+            --rebuild) rebuild_kernel=true; shift ;;  # Alternative flag
+            *) print_error "Unknown build-kernel option: $1"; exit 1 ;;
+        esac
+    done
     
     print_header "Building Custom Firecracker Kernel"
     
+    # Resolve config file path
+    if [[ ! "$kernel_config" = /* ]]; then
+        # Relative path - make it relative to script directory
+        kernel_config="${SCRIPT_DIR}/${kernel_config}"
+    fi
+    
     if [ ! -f "$kernel_config" ]; then
         print_error "Kernel config not found: $kernel_config"
-        print_info "Expected: working-kernel-config in script directory"
+        print_info "Expected: working-kernel-config in script directory or specify with --config"
         exit 1
     fi
     
     local kernel_dir="kernels/linux-${KERNEL_VERSION}"
     local kernel_output="kernels/vmlinux-${KERNEL_VERSION}-ubuntu24"
     
-    if [ -f "$kernel_output" ]; then
+    # Check if kernel exists and handle rebuild
+    if [ -f "$kernel_output" ] && [ "$rebuild_kernel" = false ]; then
         print_warning "Kernel already exists: $kernel_output"
         print_info "Use --rebuild-kernel to recreate"
         return 0
+    elif [ -f "$kernel_output" ] && [ "$rebuild_kernel" = true ]; then
+        print_info "Rebuilding kernel (--rebuild-kernel specified)"
+        rm -f "$kernel_output"
     fi
+    
+    print_info "Using kernel config: $(basename "$kernel_config")"
     
     print_info "Downloading Linux kernel ${KERNEL_VERSION}..."
     if [ ! -d "$kernel_dir" ]; then
@@ -131,6 +154,12 @@ build_kernel() {
     fi
     
     cd "$kernel_dir"
+    
+    # Clean previous build if rebuilding
+    if [ "$rebuild_kernel" = true ]; then
+        print_info "Cleaning previous build..."
+        make clean 2>/dev/null || true
+    fi
     
     print_info "Applying kernel configuration..."
     cp "$kernel_config" .config
@@ -148,6 +177,9 @@ build_kernel() {
                 echo "$line" >> .config
             fi
         done < "$kernel_patch"
+    else
+        print_warning "Ubuntu 24.04 patch file not found: $kernel_patch"
+        print_info "Building with base config only"
     fi
     
     # Resolve config dependencies
@@ -163,17 +195,39 @@ build_kernel() {
     
     local size=$(du -h "${kernel_output}" | cut -f1)
     print_info "✅ Kernel built: ${kernel_output} (${size})"
+    
+    # Show kernel info
+    print_info "Kernel details:"
+    print_info "  Version: ${KERNEL_VERSION}"
+    print_info "  Config: $(basename "$kernel_config")"
+    print_info "  Output: ${kernel_output}"
+    print_info "  Size: ${size}"
 }
 
 # Build Ubuntu 24.04 runner filesystem with all packages
 build_filesystem() {
+    local rebuild_fs=false
+    
+    # Parse build-fs arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --rebuild-fs) rebuild_fs=true; shift ;;
+            --rebuild) rebuild_fs=true; shift ;;  # Alternative flag
+            *) print_error "Unknown build-fs option: $1"; exit 1 ;;
+        esac
+    done
+    
     print_header "Building Ubuntu 24.04 GitHub Actions Runner Filesystem"
     
     local image_file="images/actions-runner-ubuntu-24.04.ext4"
     
-    if [ -f "${image_file}" ]; then
+    # Check if filesystem exists and handle rebuild
+    if [ -f "${image_file}" ] && [ "$rebuild_fs" = false ]; then
         print_warning "Filesystem already exists. Use --rebuild-fs to recreate."
         return 0
+    elif [ -f "${image_file}" ] && [ "$rebuild_fs" = true ]; then
+        print_info "Rebuilding filesystem (--rebuild-fs specified)"
+        rm -f "${image_file}"
     fi
     
     print_info "Creating ${ROOTFS_SIZE} filesystem image..."
@@ -333,16 +387,37 @@ create_snapshot() {
     
     print_header "Creating Snapshot: ${snapshot_name}"
     
+    # Validate snapshot name
+    if [[ ! "$snapshot_name" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+        print_error "Invalid snapshot name. Use only letters, numbers, dots, dashes, and underscores."
+        exit 1
+    fi
+    
     if [ ! -f "$image_file" ]; then
         print_error "No filesystem image found. Run: $0 build-fs"
         exit 1
     fi
     
     local snapshot_dir="snapshots/${snapshot_name}"
+    
+    # Check if snapshot already exists
+    if [ -d "$snapshot_dir" ]; then
+        print_error "Snapshot already exists: $snapshot_name"
+        print_info "Remove existing snapshot or use a different name"
+        exit 1
+    fi
+    
     mkdir -p "$snapshot_dir"
     
-    print_info "Creating snapshot..."
-    cp "$image_file" "${snapshot_dir}/rootfs.ext4"
+    print_info "Creating snapshot from: $(basename "$image_file")"
+    print_info "Copying filesystem (this may take a few minutes)..."
+    
+    # Copy with progress if available
+    if command -v pv &> /dev/null; then
+        pv "$image_file" > "${snapshot_dir}/rootfs.ext4"
+    else
+        cp "$image_file" "${snapshot_dir}/rootfs.ext4"
+    fi
     
     # Create metadata
     cat > "${snapshot_dir}/info.json" <<EOF
@@ -351,12 +426,15 @@ create_snapshot() {
   "created": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
   "runner_version": "${RUNNER_VERSION}",
   "docker_version": "${DOCKER_VERSION}",
-  "kernel_version": "${KERNEL_VERSION}"
+  "kernel_version": "${KERNEL_VERSION}",
+  "source_image": "$(basename "$image_file")",
+  "image_size": "$(du -h "$image_file" | cut -f1)"
 }
 EOF
     
     local size=$(du -h "$snapshot_dir" | cut -f1)
     print_info "✅ Snapshot created: ${snapshot_dir} (${size})"
+    print_info "Snapshot ready for deployment with: $0 launch --snapshot $snapshot_name"
 }
 
 # Launch VM with cloud-init networking
@@ -601,20 +679,28 @@ list_vms() {
     echo -e "${GREEN}Kernels:${NC}"
     if [ -d "kernels" ] && ls kernels/vmlinux-* &>/dev/null; then
         for kernel in kernels/vmlinux-*; do
-            [ -f "$kernel" ] && echo "  $(basename "$kernel") - $(du -h "$kernel" | cut -f1)"
+            if [ -f "$kernel" ]; then
+                local size=$(du -h "$kernel" | cut -f1)
+                local name=$(basename "$kernel")
+                echo "  $name ($size)"
+            fi
         done
     else
-        echo "  None"
+        echo "  None built yet - run: $0 build-kernel"
     fi
     echo
     
     echo -e "${GREEN}Images:${NC}"
     if [ -d "images" ] && ls images/*.ext4 &>/dev/null; then
         for img in images/*.ext4; do
-            [ -f "$img" ] && echo "  $(basename "$img") - $(du -h "$img" | cut -f1)"
+            if [ -f "$img" ]; then
+                local size=$(du -h "$img" | cut -f1)
+                local name=$(basename "$img")
+                echo "  $name ($size)"
+            fi
         done
     else
-        echo "  None" 
+        echo "  None built yet - run: $0 build-fs" 
     fi
     echo
     
@@ -624,11 +710,13 @@ list_vms() {
             if [ -f "$snap" ]; then
                 local name=$(jq -r '.name' "$snap")
                 local created=$(jq -r '.created' "$snap")
-                echo "  $name - $created"
+                local size=$(jq -r '.image_size // "unknown"' "$snap")
+                local runner_ver=$(jq -r '.runner_version // "unknown"' "$snap")
+                echo "  $name - created: $created, size: $size, runner: v$runner_ver"
             fi
         done
     else
-        echo "  None"
+        echo "  None created yet - run: $0 snapshot <name>"
     fi
     echo
     
@@ -639,15 +727,38 @@ list_vms() {
                 local name=$(jq -r '.name' "$inst")
                 local ip=$(jq -r '.ip' "$inst") 
                 local pid=$(jq -r '.pid' "$inst")
+                local github_url=$(jq -r '.github_url // "none"' "$inst")
+                local labels=$(jq -r '.labels // "none"' "$inst")
+                
                 if kill -0 "$pid" 2>/dev/null; then
-                    echo "  $name - $ip (PID: $pid) ✅"
+                    echo "  ✅ $name - $ip (PID: $pid)"
+                    echo "     GitHub: $github_url"
+                    echo "     Labels: $labels"
                 else
-                    echo "  $name - $ip (stopped) ❌"
+                    echo "  ❌ $name - $ip (stopped)"
                 fi
             fi
         done
     else
-        echo "  None"
+        echo "  None running - run: $0 launch [options]"
+    fi
+    
+    # Show network status if running on Linux
+    if [[ "$(uname -s)" == "Linux" ]] && command -v ip &> /dev/null; then
+        echo
+        echo -e "${GREEN}Network Status:${NC}"
+        if ip link show firecracker-br0 >/dev/null 2>&1; then
+            local bridge_ip=$(ip addr show firecracker-br0 | grep 'inet ' | awk '{print $2}' | head -1)
+            echo "  Bridge: firecracker-br0 ($bridge_ip) ✅"
+        else
+            echo "  Bridge: firecracker-br0 (not configured)"
+        fi
+        
+        if ip link show firecracker-tap0 >/dev/null 2>&1; then
+            echo "  TAP: firecracker-tap0 ✅"
+        else
+            echo "  TAP: firecracker-tap0 (not configured)"
+        fi
     fi
 }
 
@@ -709,8 +820,8 @@ usage() {
     echo "Usage: $0 <command> [options]"
     echo ""
     echo "Build Commands:"
-    echo "  build-kernel              Build custom kernel with Ubuntu 24.04 support"
-    echo "  build-fs                  Build filesystem with GitHub Actions runner"
+    echo "  build-kernel [options]    Build custom kernel with Ubuntu 24.04 support"
+    echo "  build-fs [options]        Build filesystem with GitHub Actions runner"
     echo "  snapshot [name]           Create snapshot from filesystem"
     echo ""
     echo "VM Management:"
@@ -718,6 +829,15 @@ usage() {
     echo "  list                      List all resources"
     echo "  stop [pattern]            Stop VMs (optional regex pattern)" 
     echo "  cleanup                   Stop all VMs and cleanup"
+    echo ""
+    echo "Build-Kernel Options:"
+    echo "  --config <path>           Custom kernel config file (default: working-kernel-config)"
+    echo "  --rebuild-kernel          Force rebuild even if kernel exists"
+    echo "  --rebuild                 Same as --rebuild-kernel"
+    echo ""
+    echo "Build-FS Options:"
+    echo "  --rebuild-fs              Force rebuild even if filesystem exists"
+    echo "  --rebuild                 Same as --rebuild-fs"
     echo ""
     echo "Launch Options:"
     echo "  --snapshot <name>         Use specific snapshot"
@@ -731,18 +851,26 @@ usage() {
     echo "  --no-cloud-init           Disable cloud-init"
     echo ""
     echo "Examples:"
-    echo "  $0 build-kernel           # Build kernel with Ubuntu 24.04 support"
-    echo "  $0 build-fs               # Build filesystem with GitHub Actions runner"  
-    echo "  $0 snapshot prod-v1       # Create production snapshot"
+    echo "  $0 build-kernel                    # Build kernel with default config"
+    echo "  $0 build-kernel --config my.config # Build kernel with custom config"
+    echo "  $0 build-kernel --rebuild-kernel   # Force rebuild kernel"
+    echo "  $0 build-fs                        # Build filesystem"
+    echo "  $0 build-fs --rebuild-fs           # Force rebuild filesystem"
+    echo "  $0 snapshot prod-v1                # Create production snapshot"
     echo "  $0 launch --github-url https://github.com/org/repo --github-token ghp_xxx"
-    echo "  $0 list                   # Show all resources"
-    echo "  $0 cleanup                # Stop everything"
+    echo "  $0 list                            # Show all resources"
+    echo "  $0 cleanup                         # Stop everything"
 }
 
 # Main function
 main() {
     local cmd="${1:-help}"
     shift || true
+    
+    # Show banner for main commands (not for help/version)
+    if [[ "$cmd" =~ ^(build-kernel|build-fs|snapshot|launch|list|cleanup)$ ]]; then
+        print_banner
+    fi
     
     case "$cmd" in
         build-kernel)
@@ -780,7 +908,19 @@ main() {
             setup_workspace
             cleanup
             ;;
-        help|--help|-h)
+        version|--version|-v)
+            echo "Firecracker Complete v${VERSION}"
+            echo "GitHub Actions Runner on Firecracker VMs"
+            echo ""
+            echo "Features:"
+            echo "  • Custom kernel building with Ubuntu 24.04 support"
+            echo "  • Complete filesystem with Docker CE + GitHub Actions runner"
+            echo "  • Cloud-init networking with shared bridge architecture"
+            echo "  • VM management and monitoring"
+            echo ""
+            echo "Requirements: Ubuntu 24.04+ with KVM support"
+            ;;
+        help|--help|-h|"")
             usage
             ;;
         *)
