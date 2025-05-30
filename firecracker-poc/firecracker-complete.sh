@@ -126,7 +126,6 @@ setup_workspace() {
 # Build custom kernel with Ubuntu 24.04 package support
 build_kernel() {
     local kernel_config="${SCRIPT_DIR}/working-kernel-config"
-    local kernel_patch="${SCRIPT_DIR}/enable-ubuntu-features.patch"
     local rebuild_kernel=false
     local skip_deps=false
     
@@ -187,24 +186,6 @@ build_kernel() {
     
     print_info "Applying kernel configuration..."
     cp "$kernel_config" .config
-    
-    # Apply Ubuntu 24.04 package support patches
-    if [ -f "$kernel_patch" ]; then
-        print_info "Applying Ubuntu 24.04 feature patches..."
-        # Process patch file and apply to .config
-        while IFS= read -r line; do
-            if [[ "$line" =~ ^CONFIG_.*=.*$ ]]; then
-                config_name=$(echo "$line" | cut -d'=' -f1)
-                # Remove existing config line and add new one
-                sed -i "/^${config_name}=/d" .config
-                sed -i "/^# ${config_name} is not set/d" .config
-                echo "$line" >> .config
-            fi
-        done < "$kernel_patch"
-    else
-        print_warning "Ubuntu 24.04 patch file not found: $kernel_patch"
-        print_info "Building with base config only"
-    fi
     
     # Resolve config dependencies
     print_info "Resolving kernel configuration dependencies..."
@@ -486,10 +467,12 @@ EOF
     sudo tee "${mount_dir}/etc/docker/daemon.json" > /dev/null <<'EOF'
 {
   "storage-driver": "overlay2",
-  "iptables": false,
+  "iptables": true,
   "ip6tables": false,
-  "bridge": "none",
-  "userland-proxy": false,
+  "bridge": "docker0",
+  "userland-proxy": true,
+  "ip-forward": true,
+  "ip-masq": false,
   "features": {
     "buildkit": true
   },
@@ -497,7 +480,13 @@ EOF
   "log-opts": {
     "max-size": "10m",
     "max-file": "3"
-  }
+  },
+  "default-address-pools": [
+    {
+      "base": "172.17.0.0/16",
+      "size": 24
+    }
+  ]
 }
 EOF
     
@@ -520,10 +509,14 @@ EOF
     sudo tee "${mount_dir}/etc/sysctl.d/99-docker.conf" > /dev/null <<'EOF'
 # Docker networking configuration
 net.ipv4.ip_forward = 1
-net.bridge.bridge-nf-call-iptables = 1
-net.bridge.bridge-nf-call-ip6tables = 1
 net.ipv4.conf.all.forwarding = 1
 net.ipv6.conf.all.forwarding = 1
+
+# Bridge netfilter settings (if available)
+# These may not work if br_netfilter module is missing
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.bridge.bridge-nf-call-arptables = 1
 EOF
     
     # Setup script for runner configuration
@@ -815,6 +808,159 @@ EOF
     print_info "Snapshot ready for deployment with: $0 launch --snapshot $snapshot_name"
 }
 
+# Setup Docker networking (common function for all modes)
+setup_docker_networking() {
+    log "Configuring Docker networking..."
+    
+    # Enable IPv4 forwarding
+    echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.conf
+    echo 'net.bridge.bridge-nf-call-iptables = 1' >> /etc/sysctl.conf 2>/dev/null || true
+    echo 'net.bridge.bridge-nf-call-ip6tables = 1' >> /etc/sysctl.conf 2>/dev/null || true
+    sysctl -p
+    
+    # Load networking modules with graceful fallback
+    log "Loading networking modules..."
+    modprobe br_netfilter 2>/dev/null && log "✅ br_netfilter loaded" || log "⚠️  br_netfilter not available"
+    modprobe xt_conntrack 2>/dev/null && log "✅ xt_conntrack loaded" || log "⚠️  xt_conntrack not available" 
+    modprobe overlay 2>/dev/null && log "✅ overlay loaded" || log "⚠️  overlay not available"
+    modprobe bridge 2>/dev/null && log "✅ bridge loaded" || log "⚠️  bridge not available"
+    
+    # Setup fallback iptables rules if needed
+    if ! lsmod | grep -q br_netfilter; then
+        log "Setting up fallback iptables rules for Docker"
+        iptables -t nat -A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE 2>/dev/null || true
+        iptables -A FORWARD -o docker0 -j ACCEPT 2>/dev/null || true
+        iptables -A FORWARD -i docker0 ! -o docker0 -j ACCEPT 2>/dev/null || true
+    fi
+    
+    # Restart Docker and test
+    log "Restarting Docker..."
+    systemctl restart docker
+    sleep 10
+    
+    # Test Docker functionality
+    if timeout 30 docker run --rm alpine:latest echo "Docker test" >/dev/null 2>&1; then
+        log "✅ Docker networking functional"
+        return 0
+    else
+        log "⚠️  Docker test failed - continuing anyway"
+        return 1
+    fi
+}
+
+# Setup GitHub runner (common function)
+setup_github_runner() {
+    local runner_mode="$1"
+    
+    log "Configuring GitHub Actions runner in $runner_mode mode..."
+    cd /opt/runner
+    
+    # Remove existing config
+    sudo -u runner ./config.sh remove --token "$RUNNER_TOKEN" 2>/dev/null || true
+    
+    # Create work directory
+    mkdir -p /tmp/runner-work
+    chown runner:runner /tmp/runner-work
+    
+    # Configure runner
+    sudo -u runner ./config.sh \
+        --url "$GITHUB_URL" \
+        --token "$RUNNER_TOKEN" \
+        --name "${RUNNER_NAME:-$(hostname)}" \
+        --labels "${RUNNER_LABELS:-firecracker}" \
+        --work "/tmp/runner-work" \
+        --unattended --replace || {
+        log "ERROR: Runner configuration failed"
+        return 1
+    }
+    
+    log "✅ Runner configured successfully"
+    return 0
+}
+
+# Job completion handling for ephemeral VMs
+handle_job_completion() {
+    log "Setting up job completion monitoring..."
+    
+    cat > /usr/local/bin/monitor-job-completion.sh << 'EOF'
+#!/bin/bash
+set -euo pipefail
+
+# Source logging function
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a /var/log/job-monitor.log
+}
+
+LAST_JOB_CHECK=$(date +%s)
+JOB_RUNNING=false
+
+while true; do
+    # Check if runner worker is active
+    if pgrep -f "Runner.Worker" >/dev/null; then
+        if [ "$JOB_RUNNING" = false ]; then
+            log "Job started - worker process detected"
+            JOB_RUNNING=true
+        fi
+        LAST_JOB_CHECK=$(date +%s)
+    else
+        if [ "$JOB_RUNNING" = true ]; then
+            log "Job completed - worker process finished"
+            JOB_RUNNING=false
+            
+            # Signal completion for ephemeral VMs
+            if [ "${EPHEMERAL_MODE:-false}" = "true" ]; then
+                log "Ephemeral mode: VM shutting down after job completion"
+                
+                # Create completion signal
+                echo "job_completed:$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /tmp/ephemeral-cleanup
+                
+                # Give time for logs to flush
+                sleep 5
+                
+                # Shutdown the VM
+                log "Shutting down VM..."
+                shutdown -h +1 "Job completed - ephemeral shutdown" &
+                exit 0
+            fi
+        fi
+    fi
+    
+    # Check if runner service is still alive
+    if ! systemctl is-active --quiet github-runner; then
+        log "Runner service stopped - restarting"
+        systemctl restart github-runner
+        sleep 10
+    fi
+    
+    sleep 5
+done
+EOF
+    
+    chmod +x /usr/local/bin/monitor-job-completion.sh
+    
+    # Create systemd service for job monitoring
+    cat > /etc/systemd/system/job-monitor.service << 'EOF'
+[Unit]
+Description=GitHub Actions Job Completion Monitor
+After=github-runner.service
+Requires=github-runner.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/monitor-job-completion.sh
+Restart=always
+RestartSec=10
+Environment=EPHEMERAL_MODE=${EPHEMERAL_MODE:-false}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    systemctl enable job-monitor
+    log "✅ Job completion monitoring configured"
+}
+
 # Launch VM with cloud-init networking
 launch_vm() {
     local snapshot_name=""
@@ -1067,336 +1213,107 @@ launch_vm() {
             setup_script_content="#!/bin/bash
       set -euo pipefail
       
-      # ARC-mode: Integrate with Actions Runner Controller
-      log() {
-          echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] \$1\" | tee -a /var/log/setup-runner.log
-      }
-      
-      # Report status to ARC controller
-      report_status() {
-          local status=\"\$1\"
-          local message=\"\$2\"
-          local timestamp=\"\$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
-          
-          # Always log status locally
-          log \"STATUS: \$status - \$message\"
-          
-          if [ -n \"${arc_controller_url}\" ]; then
-              # Try to report to ARC controller
-              if curl -X POST \"${arc_controller_url}/api/v1/runners/${runner_name}/status\" \\
-                  -H \"Content-Type: application/json\" \\
-                  -d \"{\\\"status\\\": \\\"\$status\\\", \\\"message\\\": \\\"\$message\\\", \\\"timestamp\\\": \\\"\$timestamp\\\"}\" \\
-                  --connect-timeout 5 --max-time 10 >/dev/null 2>&1; then
-                  log \"✅ Status reported to ARC controller: \$status\"
-              else
-                  log \"⚠️  ARC controller unreachable - running in offline mode\"
-                  # Store status for later reporting
-                  echo \"\$timestamp|\$status|\$message\" >> /var/log/arc-status-offline.log
-              fi
-          else
-              log \"ℹ️  No ARC controller configured - status logged locally only\"
-          fi
-      }
+      # Source common functions
+      $(declare -f log)
+      $(declare -f setup_docker_networking)
+      $(declare -f setup_github_runner)
+      $(declare -f handle_job_completion)
       
       log \"=== ARC-Mode GitHub Actions Runner Setup ===\"
       
-      # Report VM startup
-      report_status \"starting\" \"VM starting up\"
-      
-      # Wait for network connectivity
+      # Wait for network
       log \"Waiting for network connectivity...\"
       for i in {1..30}; do
           if curl -s --connect-timeout 3 https://api.github.com/zen >/dev/null; then
               log \"Network connectivity confirmed\"
               break
           fi
-          if [ \$i -eq 30 ]; then
-              log \"ERROR: Network connectivity timeout\"
-              report_status \"failed\" \"Network connectivity timeout\"
-              exit 1
-          fi
+          [ \$i -eq 30 ] && { log \"Network timeout\"; exit 1; }
           sleep 2
       done
       
       # Start Docker
-      log \"Starting Docker service...\"
       systemctl start docker
-      sleep 5
       usermod -aG docker runner
       
-      # Fix Docker networking issues
-      log \"Configuring Docker networking...\"
+      # Setup Docker networking
+      setup_docker_networking
       
-      # Enable IPv4 forwarding (required for Docker networking)
-      echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.conf
-      echo 'net.bridge.bridge-nf-call-iptables = 1' >> /etc/sysctl.conf
-      echo 'net.bridge.bridge-nf-call-ip6tables = 1' >> /etc/sysctl.conf
-      sysctl -p
+      # Setup runner
+      setup_github_runner \"arc\"
       
-      # Load required kernel modules for Docker bridge networking
-      modprobe br_netfilter 2>/dev/null || log \"Warning: br_netfilter module not available\"
-      modprobe xt_conntrack 2>/dev/null || log \"Warning: xt_conntrack module not available\" 
-      modprobe overlay 2>/dev/null || log \"Warning: overlay module not available\"
+      # Setup job monitoring for ephemeral mode
+      export EPHEMERAL_MODE=\"${ephemeral_mode}\"
+      handle_job_completion
       
-      # Restart Docker to pick up networking changes
-      log \"Restarting Docker with updated networking...\"
-      systemctl restart docker
-      sleep 10
-      
-      # Configure runner
-      log \"Configuring GitHub Actions runner...\"
-      cd /opt/runner
-      
-      # Remove existing config
-      sudo -u runner ./config.sh remove --token \"\$RUNNER_TOKEN\" 2>/dev/null || true
-      
-      # Configure runner
-      sudo -u runner ./config.sh \\
-          --url \"\$GITHUB_URL\" \\
-          --token \"\$RUNNER_TOKEN\" \\
-          --name \"\${RUNNER_NAME:-\$(hostname)}\" \\
-          --labels \"\${RUNNER_LABELS:-firecracker}\" \\
-          --work \"/tmp/runner-work\" \\
-          --unattended --replace
-      
-      report_status \"ready\" \"Runner configured and ready\"
-      
-      # Create job monitoring script
-      cat > /usr/local/bin/monitor-jobs.sh << 'MONITOR_EOF'
-#!/bin/bash
-RUNNER_PID=\"\"
-JOB_RUNNING=false
-LAST_JOB_TIME=\$(date +%s)
-
-# Function to check if runner is executing a job
-check_job_status() {
-    if pgrep -f \"Runner.Worker\" >/dev/null; then
-        if [ \"\$JOB_RUNNING\" = false ]; then
-            log \"Job started\"
-            report_status \"running\" \"Executing job\"
-            JOB_RUNNING=true
-        fi
-        LAST_JOB_TIME=\$(date +%s)
-    else
-        if [ \"\$JOB_RUNNING\" = true ]; then
-            log \"Job completed\"
-            report_status \"completed\" \"Job finished\"
-            JOB_RUNNING=false
-            
-            # If ephemeral mode, shutdown after job completion
-            if [ \"${ephemeral_mode}\" = \"true\" ]; then
-                log \"Ephemeral mode: Shutting down VM after job completion\"
-                report_status \"shutting_down\" \"VM shutting down (ephemeral mode)\"
-                
-                # Create cleanup signal for host
-                echo \"job_completed:$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > /tmp/ephemeral-cleanup
-                
-                # Notify host to destroy VM (if possible)
-                if curl -X POST \"http://172.16.0.1:8081/vm/destroy\" \\
-                    -H \"Content-Type: application/json\" \\
-                    -d \"{\\\"vm_id\\\": \\\"$(hostname)\\\", \\\"reason\\\": \\\"job_completed\\\"}\" \\
-                    --connect-timeout 2 --max-time 5 2>/dev/null; then
-                    log \"Host notified for VM destruction\"
-                else
-                    log \"Host notification failed, proceeding with shutdown\"
-                fi
-                
-                sleep 5
-                shutdown -h now
-            fi
-        fi
-    fi
-}
-
-# Monitor runner process
-while true; do
-    check_job_status
-    
-    # Check if runner process is still alive
-    if ! pgrep -f \"actions.runner\" >/dev/null; then
-        log \"Runner process died, restarting...\"
-        report_status \"restarting\" \"Runner process died, restarting\"
-        systemctl restart github-runner
-        sleep 10
-    fi
-    
-    sleep 5
-done
-MONITOR_EOF
-      
-      chmod +x /usr/local/bin/monitor-jobs.sh
-      
-      # Start runner and monitoring
-      log \"Starting GitHub runner with ARC integration...\"
+      # Start services
       systemctl start github-runner
-      
-      # Start job monitoring in background
-      nohup /usr/local/bin/monitor-jobs.sh > /var/log/job-monitor.log 2>&1 &
+      systemctl start job-monitor
       
       log \"=== ARC Setup Complete ===\""
         elif [ "$docker_mode" = true ]; then
             setup_script_content="#!/bin/bash
       set -euo pipefail
       
-      # Docker-mode: Run runner directly like in container
-      log() {
-          echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] \$1\" | tee -a /var/log/setup-runner.log
-      }
+      # Source common functions
+      $(declare -f log)
+      $(declare -f setup_docker_networking)
+      $(declare -f setup_github_runner)
       
       log \"=== Docker-Mode GitHub Actions Runner Setup ===\"
       
-      # Wait for network connectivity
-      log \"Waiting for network connectivity...\"
+      # Wait for network
       for i in {1..30}; do
           if curl -s --connect-timeout 3 https://api.github.com/zen >/dev/null; then
-              log \"Network connectivity confirmed\"
+              log \"Network ready\"
               break
           fi
-          if [ \$i -eq 30 ]; then
-              log \"ERROR: Network connectivity timeout\"
-              exit 1
-          fi
+          [ \$i -eq 30 ] && exit 1
           sleep 2
       done
       
-      # Start Docker
-      log \"Starting Docker service...\"
+      # Start Docker and setup networking
       systemctl start docker
-      sleep 5
-      
-      # Add runner user to docker group
       usermod -aG docker runner
+      setup_docker_networking
       
-      # Fix Docker networking issues
-      log \"Configuring Docker networking...\"
+      # Setup runner
+      setup_github_runner \"docker\"
       
-      # Enable IPv4 forwarding (required for Docker networking)
-      echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.conf
-      echo 'net.bridge.bridge-nf-call-iptables = 1' >> /etc/sysctl.conf
-      echo 'net.bridge.bridge-nf-call-ip6tables = 1' >> /etc/sysctl.conf
-      sysctl -p
-      
-      # Load required kernel modules for Docker bridge networking
-      modprobe br_netfilter 2>/dev/null || log \"Warning: br_netfilter module not available\"
-      modprobe xt_conntrack 2>/dev/null || log \"Warning: xt_conntrack module not available\" 
-      modprobe overlay 2>/dev/null || log \"Warning: overlay module not available\"
-      
-      # Restart Docker to pick up networking changes
-      log \"Restarting Docker with updated networking...\"
-      systemctl restart docker
-      sleep 10
-      
-      # Verify Docker networking
-      log \"Testing Docker networking...\"
-      if docker network ls | grep bridge >/dev/null; then
-          log \"✅ Docker bridge network available\"
-      else
-          log \"❌ Docker bridge network not found\"
-      fi
-      
-      # Test Docker connectivity
-      if docker run --rm alpine:latest sh -c \"echo 'Docker networking test'\" >/dev/null 2>&1; then
-          log \"✅ Docker networking functional\"
-      else
-          log \"⚠️  Docker networking may have issues\"
-      fi
-      
-      # Configure and start runner in Docker mode
-      log \"Configuring runner in Docker mode...\"
-      cd /opt/runner
-      
-      # Remove existing config
-      sudo -u runner ./config.sh remove --token \"\$RUNNER_TOKEN\" 2>/dev/null || true
-      
-      # Configure runner
-      sudo -u runner ./config.sh \\
-          --url \"\$GITHUB_URL\" \\
-          --token \"\$RUNNER_TOKEN\" \\
-          --name \"\${RUNNER_NAME:-\$(hostname)}\" \\
-          --labels \"\${RUNNER_LABELS:-firecracker}\" \\
-          --work \"/tmp/runner-work\" \\
-          --unattended --replace
-      
+      # Run in foreground like Docker containers do
       log \"Starting runner in foreground (Docker mode)...\"
-      # Start runner in foreground like Docker does
+      cd /opt/runner
       exec sudo -u runner ./run.sh"
         else
             setup_script_content="#!/bin/bash
       set -euo pipefail
 
-      # Systemd-mode: Traditional service approach
-      log() {
-          echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] \$1\" | tee -a /var/log/setup-runner.log
-      }
+      # Source common functions
+      $(declare -f log)
+      $(declare -f setup_docker_networking)
+      $(declare -f setup_github_runner)
 
       log \"=== Systemd-Mode GitHub Actions Runner Setup ===\"
 
-      # Wait for network connectivity
-      log \"Waiting for network connectivity...\"
+      # Wait for network
       for i in {1..30}; do
           if curl -s --connect-timeout 3 https://api.github.com/zen >/dev/null; then
-              log \"Network connectivity confirmed\"
+              log \"Network ready\"
               break
           fi
-          if [ \$i -eq 30 ]; then
-              log \"ERROR: Network connectivity timeout\"
-              exit 1
-          fi
+          [ \$i -eq 30 ] && exit 1
           sleep 2
       done
 
-      # Start Docker
-      log \"Starting Docker service...\"
+      # Start Docker and setup networking
       systemctl start docker
-      sleep 5
-
-      # Add runner user to docker group
       usermod -aG docker runner
+      setup_docker_networking
       
-      # Fix Docker networking issues
-      log \"Configuring Docker networking...\"
-      
-      # Enable IPv4 forwarding (required for Docker networking)
-      echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.conf
-      echo 'net.bridge.bridge-nf-call-iptables = 1' >> /etc/sysctl.conf
-      echo 'net.bridge.bridge-nf-call-ip6tables = 1' >> /etc/sysctl.conf
-      sysctl -p
-      
-      # Load required kernel modules for Docker bridge networking
-      modprobe br_netfilter 2>/dev/null || log \"Warning: br_netfilter module not available\"
-      modprobe xt_conntrack 2>/dev/null || log \"Warning: xt_conntrack module not available\" 
-      modprobe overlay 2>/dev/null || log \"Warning: overlay module not available\"
-      
-      # Restart Docker to pick up networking changes
-      log \"Restarting Docker with updated networking...\"
-      systemctl restart docker
-      sleep 10
-      
-      # Configure runner
-      log \"Configuring GitHub Actions runner...\"
-      cd /opt/runner
-      
-      # Remove any existing configuration
-      if [ -f .runner ]; then
-          log \"Removing existing runner configuration...\"
-          sudo -u runner ./config.sh remove --token \"\$RUNNER_TOKEN\" || true
-      fi
-      
-      # Create work directory
-      mkdir -p /tmp/runner-work
-      chown runner:runner /tmp/runner-work
-      
-      log \"Running runner configuration...\"
-      sudo -u runner ./config.sh \\
-          --url \"\$GITHUB_URL\" \\
-          --token \"\$RUNNER_TOKEN\" \\
-          --name \"\${RUNNER_NAME:-\$(hostname)}\" \\
-          --labels \"\${RUNNER_LABELS:-firecracker}\" \\
-          --work \"/tmp/runner-work\" \\
-          --unattended --replace
-      
+      # Setup runner
+      setup_github_runner \"systemd\"
+
       # Start systemd service
-      log \"Starting GitHub runner service...\"
       systemctl start github-runner
 
       log \"=== Setup Complete ===\""
@@ -1874,114 +1791,56 @@ check_runner() {
 monitor_ephemeral() {
     print_header "Monitoring Ephemeral VMs"
     
-    # Start simple HTTP server for VM destruction requests
-    start_destruction_server() {
-        print_info "Starting VM destruction server on port 8081..."
-        
-        while true; do
-            if command -v nc >/dev/null; then
-                echo -e "HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nVM_DESTROYED" | nc -l -p 8081 | while read -r line; do
-                    if echo "$line" | grep -q "POST /vm/destroy"; then
-                        # Extract VM ID from request (simplified)
-                        local vm_id=$(echo "$line" | grep -o '"vm_id":"[^"]*"' | cut -d'"' -f4)
-                        if [ -n "$vm_id" ]; then
-                            print_info "Destruction request for VM: $vm_id"
-                            destroy_vm "$vm_id"
-                        fi
-                    fi
-                done
-            else
-                print_warning "netcat not available for destruction server"
-                sleep 30
-            fi
-        done &
-        
-        echo $! > /tmp/destruction-server.pid
-        print_info "Destruction server started (PID: $(cat /tmp/destruction-server.pid))"
-    }
+    print_info "Starting ephemeral VM monitoring..."
     
-    # Destroy specific VM
-    destroy_vm() {
-        local vm_id="$1"
-        print_info "Destroying ephemeral VM: $vm_id"
-        
-        # Find the VM instance
-        local instance_dir=""
+    while true; do
+        # Check all running VMs
         for inst in instances/*/info.json; do
             if [ -f "$inst" ]; then
-                local name=$(jq -r '.vm_id // .name' "$inst" 2>/dev/null)
-                if [[ "$name" == *"$vm_id"* ]]; then
-                    instance_dir=$(dirname "$inst")
-                    break
+                local instance_dir=$(dirname "$inst")
+                local vm_name=$(jq -r '.name' "$inst" 2>/dev/null)
+                local pid=$(jq -r '.pid' "$inst" 2>/dev/null)
+                local ip=$(jq -r '.ip' "$inst" 2>/dev/null)
+                local ephemeral=$(jq -r '.ephemeral_mode' "$inst" 2>/dev/null)
+                
+                # Skip non-ephemeral VMs
+                if [ "$ephemeral" != "true" ]; then
+                    continue
                 fi
-            fi
-        done
-        
-        if [ -n "$instance_dir" ]; then
-            local pid=$(jq -r '.pid' "$instance_dir/info.json" 2>/dev/null)
-            local vm_name=$(jq -r '.name' "$instance_dir/info.json" 2>/dev/null)
-            
-            print_info "Stopping VM: $vm_name (PID: $pid)"
-            
-            # Kill Firecracker process
-            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-                kill "$pid" 2>/dev/null || true
-                sleep 2
-                kill -9 "$pid" 2>/dev/null || true
-            fi
-            
-            # Cleanup instance directory
-            rm -rf "$instance_dir"
-            print_info "✅ VM $vm_name destroyed and cleaned up"
-        else
-            print_warning "VM instance not found: $vm_id"
-        fi
-    }
-    
-    # Monitor VMs for completion signals
-    monitor_completion_signals() {
-        print_info "Monitoring VMs for completion signals..."
-        
-        while true; do
-            for inst in instances/*/info.json; do
-                if [ -f "$inst" ]; then
-                    local instance_dir=$(dirname "$inst")
-                    local vm_name=$(jq -r '.name' "$inst" 2>/dev/null)
-                    local pid=$(jq -r '.pid' "$inst" 2>/dev/null)
-                    
-                    # Check if VM process is dead (indicating shutdown)
-                    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
-                        print_info "Detected shutdown of ephemeral VM: $vm_name"
-                        destroy_vm "$vm_name"
-                    fi
-                    
-                    # Check for completion signal file (if VM is still running)
-                    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-                        # Try to check completion signal via SSH (simplified check)
-                        local ip=$(jq -r '.ip' "$inst" 2>/dev/null)
-                        if [ "$ip" != "null" ] && [ -n "$ip" ]; then
-                            if ssh -i "$instance_dir/ssh_key" -o ConnectTimeout=2 -o StrictHostKeyChecking=no runner@"$ip" \
-                                '[ -f /tmp/ephemeral-cleanup ]' 2>/dev/null; then
-                                print_info "Job completion signal found for VM: $vm_name"
-                                # Give VM time to shutdown gracefully
-                                sleep 10
-                                if kill -0 "$pid" 2>/dev/null; then
-                                    print_info "Force destroying VM that didn't shutdown: $vm_name"
-                                    destroy_vm "$vm_name"
-                                fi
-                            fi
+                
+                print_info "Checking ephemeral VM: $vm_name"
+                
+                # Check if VM process is still alive
+                if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+                    print_info "Ephemeral VM $vm_name has shutdown - cleaning up"
+                    rm -rf "$instance_dir"
+                    continue
+                fi
+                
+                # Check for completion signal via SSH
+                if [ "$ip" != "null" ] && [ -n "$ip" ]; then
+                    if ssh -i "$instance_dir/ssh_key" -o ConnectTimeout=3 -o StrictHostKeyChecking=no runner@"$ip" \
+                        '[ -f /tmp/ephemeral-cleanup ]' 2>/dev/null; then
+                        print_info "Job completion signal found for VM: $vm_name"
+                        
+                        # Stop the VM
+                        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                            print_info "Stopping VM process (PID: $pid)"
+                            kill "$pid" 2>/dev/null || true
+                            sleep 3
+                            kill -9 "$pid" 2>/dev/null || true
                         fi
+                        
+                        # Clean up instance
+                        rm -rf "$instance_dir"
+                        print_info "✅ Ephemeral VM $vm_name destroyed and cleaned up"
                     fi
                 fi
-            done
-            
-            sleep 15
+            fi
         done
-    }
-    
-    # Start background services
-    start_destruction_server
-    monitor_completion_signals
+        
+        sleep 15
+    done
 }
 
 # Cleanup everything  
@@ -2029,7 +1888,7 @@ usage() {
     echo "Usage: $0 <command> [options]"
     echo ""
     echo "Build Commands:"
-    echo "  build-kernel [options]    Build custom kernel with Ubuntu 24.04 support"
+    echo "  build-kernel [options]    Build custom kernel with all networking modules"
     echo "  build-fs [options]        Build filesystem with GitHub Actions runner"
     echo "  snapshot [name]           Create snapshot from filesystem"
     echo ""
@@ -2042,60 +1901,46 @@ usage() {
     echo "  monitor-ephemeral         Monitor and cleanup ephemeral VMs"
     echo "  cleanup                   Stop all VMs and cleanup"
     echo ""
-    echo "Build-Kernel Options:"
-    echo "  --config <path>           Custom kernel config file (default: working-kernel-config)"
-    echo "  --rebuild-kernel          Force rebuild even if kernel exists"
-    echo "  --rebuild                 Same as --rebuild-kernel"
-    echo "  --skip-deps               Skip dependency checks"
-    echo ""
-    echo "Build-FS Options:"
-    echo "  --rebuild-fs              Force rebuild even if filesystem exists"
-    echo "  --rebuild                 Same as --rebuild-fs"
+    echo "Build Options:"
+    echo "  --config <path>           Custom kernel config file"
+    echo "  --rebuild-kernel          Force rebuild kernel"
+    echo "  --rebuild-fs              Force rebuild filesystem"
     echo "  --skip-deps               Skip dependency checks"
     echo ""
     echo "Launch Options:"
     echo "  --snapshot <name>         Use specific snapshot"
     echo "  --name <name>             VM name"
-    echo "  --github-url <url>        GitHub repo/org URL"
-    echo "  --github-pat <pat>        GitHub personal access token (generates short-lived token)"
-    echo "  --github-token <token>    GitHub registration token (direct, for testing)"
-    echo "  --labels <labels>         Runner labels"
+    echo "  --github-url <url>        GitHub repo/org/enterprise URL"
+    echo "  --github-pat <pat>        GitHub PAT (generates registration token)"
+    echo "  --labels <labels>         Runner labels (default: firecracker)"
     echo "  --memory <mb>             VM memory (default: 2048)" 
     echo "  --cpus <count>            VM CPU count (default: 2)"
     echo "  --kernel <path>           Custom kernel path"
-    echo "  --no-cloud-init           Disable cloud-init"
-    echo "  --use-host-bridge         Use host bridge networking"
-    echo "  --docker-mode             Use Docker mode (run runner directly like container, not systemd)"
-    echo "  --arc-mode                Enable ARC integration with job lifecycle monitoring"
-    echo "  --arc-controller-url <url> ARC controller URL for status reporting"
-    echo "  --ephemeral-mode          Shutdown VM after job completion (for ARC)"
-    echo "  --skip-deps               Skip dependency checks"
+    echo "  --no-cloud-init           Disable cloud-init (testing only)"
+    echo "  --use-host-bridge         Use host bridge networking with DHCP"
+    echo "  --docker-mode             Run as Docker container (foreground)"
+    echo "  --arc-mode                Enable ARC integration"
+    echo "  --ephemeral-mode          Auto-shutdown after job completion"
     echo ""
     echo "Examples:"
-    echo "  $0 build-kernel                    # Build kernel with default config"
-    echo "  $0 build-kernel --config my.config # Build kernel with custom config"
-    echo "  $0 build-kernel --rebuild-kernel   # Force rebuild kernel"
-    echo "  $0 build-kernel --skip-deps        # Build without dependency checks"
-    echo "  $0 build-fs                        # Build filesystem"
-    echo "  $0 build-fs --rebuild-fs           # Force rebuild filesystem"
-    echo "  $0 build-fs --skip-deps            # Build without dependency checks"
-    echo "  $0 snapshot prod-v1                # Create production snapshot"
+    echo "  # Build components"
+    echo "  $0 build-kernel --rebuild-kernel"
+    echo "  $0 build-fs --rebuild-fs"
+    echo "  $0 snapshot prod-runner"
     echo ""
-    echo "  # ✅ SECURE: PAT used on host to generate registration token"
+    echo "  # Launch runners (PAT → registration token on host)"
     echo "  $0 launch --github-url https://github.com/org/repo --github-pat ghp_xxxx"
-    echo "  $0 launch --use-host-bridge --github-url https://github.com/org/repo --github-pat ghp_xxxx"
+    echo "  $0 launch --ephemeral-mode --github-url https://github.com/org/repo --github-pat ghp_xxxx"
     echo "  $0 launch --docker-mode --github-url https://github.com/org/repo --github-pat ghp_xxxx"
-    echo "  $0 launch --arc-mode --ephemeral-mode --github-url https://github.com/org/repo --github-pat ghp_xxxx"
     echo ""
-    echo "  # ⚠️  TESTING ONLY: Direct token (bypasses host generation)"
-    echo "  $0 launch --github-token ABCD1234 --github-url https://github.com/org/repo"
+    echo "  # Management"
+    echo "  $0 list                   # Show all resources"
+    echo "  $0 status                 # Check VM health"
+    echo "  $0 monitor-ephemeral      # Monitor job completion"
+    echo "  $0 cleanup                # Stop everything"
     echo ""
-    echo "  $0 launch --skip-deps --no-cloud-init --name test  # Quick test"
-    echo "  $0 list                            # Show all resources"
-    echo "  $0 status                          # Check VM status and diagnostics"
-    echo "  $0 check-runner                    # Check if GitHub runner is working"
-    echo "  $0 monitor-ephemeral               # Monitor and cleanup ephemeral VMs"
-    echo "  $0 cleanup                         # Stop everything"
+    echo "Security: PAT tokens stay on host, only short-lived registration tokens"
+    echo "          are passed to VMs (following GitHub ARC security model)"
 }
 
 # Main function
