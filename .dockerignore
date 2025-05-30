@@ -1,3 +1,15 @@
+# Build artifacts and binaries
+manager
+ghalistener
+github-webhook-server
+actions-metrics-server
+sleep
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Development and testing
 Makefile
 acceptance
 runner
@@ -8,7 +20,86 @@ charts
 .github
 .envrc
 .env
+.vscode
+.idea
+
+# Documentation and scripts
 *.md
 *.txt
 *.sh
+
+# Test files and directories
+test/
+test-assets/
 test/e2e/.docker-build
+*_test.go
+**/*_test.go
+
+# Git and version control
+.git
+.gitignore
+
+# Build cache and temporary files
+.cache/
+tmp/
+temp/
+*.tmp
+*.cache
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Log files
+*.log
+logs/
+
+# IDE files
+*.swp
+*.swo
+*~
+
+# Dependency directories
+vendor/
+node_modules/
+
+# Coverage reports
+*.out
+coverage.txt
+
+# Local environment files
+.env.local
+.env.*.local
+
+# Large test data
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+
+# Firecracker test artifacts (these can be large)
+firecracker-poc/kernels/
+firecracker-poc/images/
+firecracker-poc/*.img
+firecracker-poc/*.ext4
+firecracker-poc/*.raw
+
+# Docker-related
+docker-compose.yml
+docker-compose.yaml
+Dockerfile.*
+
+# Kubernetes manifests (not needed for build)
+manifests/
+deploy/
+*.yaml
+*.yml
+
+# Backup files
+*.bak
+*.backup
