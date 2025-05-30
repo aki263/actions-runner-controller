@@ -189,6 +189,57 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
     
+    # Configure Docker daemon to work with limited kernel features
+    sudo mkdir -p "${mount_dir}/etc/docker"
+    sudo tee "${mount_dir}/etc/docker/daemon.json" > /dev/null <<'EOF'
+{
+  "storage-driver": "overlay2",
+  "iptables": false,
+  "ip6tables": false,
+  "bridge": "none",
+  "userland-proxy": false,
+  "experimental": false,
+  "features": {
+    "buildkit": true
+  },
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
+}
+EOF
+    
+    # Create a Docker startup script that handles missing kernel modules gracefully
+    sudo tee "${mount_dir}/usr/local/bin/start-docker-safe.sh" > /dev/null <<'EOF'
+#!/bin/bash
+# Safe Docker startup script that handles missing kernel modules
+
+# Disable iptables for Docker (we handle networking externally)
+if ! systemctl is-active --quiet docker; then
+    echo "Starting Docker with limited kernel support..."
+    
+    # Try to load modules if available (but don't fail if missing)
+    modprobe overlay 2>/dev/null || echo "overlay module not available"
+    modprobe br_netfilter 2>/dev/null || echo "br_netfilter module not available"
+    modprobe xt_conntrack 2>/dev/null || echo "xt_conntrack module not available"
+    
+    # Start Docker
+    systemctl start docker
+    
+    # Wait for Docker to be ready
+    for i in {1..30}; do
+        if docker info >/dev/null 2>&1; then
+            echo "Docker started successfully"
+            break
+        fi
+        sleep 1
+    done
+fi
+EOF
+    
+    sudo chmod +x "${mount_dir}/usr/local/bin/start-docker-safe.sh"
+    
     # Setup script
     sudo tee "${mount_dir}/usr/local/bin/setup-runner.sh" > /dev/null <<'EOF'
 #!/bin/bash
@@ -196,6 +247,13 @@ if [ -z "$GITHUB_TOKEN" ] || [ -z "$GITHUB_URL" ]; then
     echo "Missing GITHUB_TOKEN or GITHUB_URL environment variables"
     exit 1
 fi
+
+# Start Docker safely (handles missing kernel modules)
+echo "Starting Docker with safe configuration..."
+/usr/local/bin/start-docker-safe.sh
+
+# Add runner user to docker group if not already
+usermod -aG docker runner 2>/dev/null || true
 
 cd /opt/runner
 sudo -u runner ./config.sh \
@@ -293,6 +351,7 @@ launch_vm() {
     local use_cloud_init=true
     local custom_kernel=""
     local use_dhcp=false
+    local no_cloud_init_network=false
     
     # Parse launch arguments
     while [[ $# -gt 0 ]]; do
@@ -307,6 +366,7 @@ launch_vm() {
             --kernel) custom_kernel="$2"; shift 2 ;;
             --dhcp) use_dhcp=true; shift ;;
             --no-cloud-init) use_cloud_init=false; shift ;;
+            --no-cloud-init-network) no_cloud_init_network=true; shift ;;
             *) print_error "Unknown option: $1"; exit 1 ;;
         esac
     done
@@ -432,17 +492,21 @@ launch_vm() {
 #cloud-config
 hostname: ${runner_name}
 
+$(if [ "$no_cloud_init_network" = false ]; then
+cat << 'NETWORK_EOF'
 # Network configuration (DHCP)
-# network:
-#   version: 2
-#   ethernets:
-#     eth0:
-#       dhcp4: true
-#       nameservers:
-#         addresses:
-#           - 8.8.8.8
-#           - 8.8.4.4
+network:
+  version: 2
+  ethernets:
+    eth0:
+      dhcp4: true
+      nameservers:
+        addresses:
+          - 8.8.8.8
+          - 8.8.4.4
 
+NETWORK_EOF
+fi)
 users:
   - name: runner
     ssh_authorized_keys:
@@ -469,7 +533,8 @@ ssh_pwauth: false
 disable_root: false
 EOF
 
-            cat > cloud-init/network-config <<EOF
+            if [ "$no_cloud_init_network" = false ]; then
+                cat > cloud-init/network-config <<EOF
 version: 2
 ethernets:
   eth0:
@@ -479,12 +544,18 @@ ethernets:
         - 8.8.8.8
         - 8.8.4.4
 EOF
+            else
+                # Create empty network-config when network is disabled
+                echo "{}" > cloud-init/network-config
+            fi
         else
             # Static IP network config
             cat > cloud-init/user-data <<EOF
 #cloud-config
 hostname: ${runner_name}
 
+$(if [ "$no_cloud_init_network" = false ]; then
+cat << 'NETWORK_EOF'
 # Network configuration (Static IP)
 network:
   version: 2
@@ -500,6 +571,8 @@ network:
           - 8.8.8.8
           - 8.8.4.4
 
+NETWORK_EOF
+fi)
 users:
   - name: runner
     ssh_authorized_keys:
@@ -518,6 +591,8 @@ write_files:
       GITHUB_URL=${github_url}
       RUNNER_NAME=${runner_name}
       RUNNER_LABELS=${labels}
+$(if [ "$no_cloud_init_network" = false ]; then
+cat << 'SERVICE_EOF'
   - path: /etc/systemd/system/setup-network.service
     content: |
       [Unit]
@@ -533,16 +608,21 @@ write_files:
       [Install]
       WantedBy=multi-user.target
 
+SERVICE_EOF
+fi)
 runcmd:
-  - systemctl enable setup-network
-  - systemctl start setup-network
+$(if [ "$no_cloud_init_network" = false ]; then
+echo "  - systemctl enable setup-network"
+echo "  - systemctl start setup-network"
+fi)
   - /usr/local/bin/setup-runner.sh
 
 ssh_pwauth: false
 disable_root: false
 EOF
 
-            cat > cloud-init/network-config <<EOF
+            if [ "$no_cloud_init_network" = false ]; then
+                cat > cloud-init/network-config <<EOF
 version: 2
 ethernets:
   eth0:
@@ -556,6 +636,10 @@ ethernets:
         - 8.8.8.8
         - 8.8.4.4
 EOF
+            else
+                # Create empty network-config when network is disabled
+                echo "{}" > cloud-init/network-config
+            fi
         fi
         
         cat > cloud-init/meta-data <<EOF
@@ -847,6 +931,7 @@ usage() {
     echo "  --kernel <path>           Use custom kernel (default: download official)"
     echo "  --dhcp                    Use DHCP for IP assignment (default: static)"
     echo "  --no-cloud-init           Disable cloud-init for manual testing"
+    echo "  --no-cloud-init-network   Disable network configuration in cloud-init while keeping other cloud-init features"
     echo ""
     echo "Examples:"
     echo "  $0 build"
@@ -855,6 +940,7 @@ usage() {
     echo "  $0 launch --snapshot prod-v1 --no-cloud-init --name test-vm"
     echo "  $0 launch --kernel ./custom-vmlinux --snapshot prod-v1 --no-cloud-init"
     echo "  $0 launch --dhcp --snapshot prod-v1 --no-cloud-init --name dhcp-test"
+    echo "  $0 launch --no-cloud-init-network --snapshot prod-v1 --github-url https://github.com/org/repo --github-token ghp_xxx"
     echo "  $0 stop test-vm"
     echo "  $0 stop runner-.*"
     echo "  $0 cleanup"
@@ -862,6 +948,10 @@ usage() {
     echo "Networking options:"
     echo "  Static IP: Each VM gets unique IP (172.16.0.10-210)"
     echo "  DHCP:      Requires dnsmasq, IPs assigned dynamically (172.16.0.100-200)"
+    echo ""
+    echo "Cloud-init options:"
+    echo "  --no-cloud-init:         Disable cloud-init completely"
+    echo "  --no-cloud-init-network: Keep cloud-init but disable network config"
     echo ""
     echo "Testing without cloud-init:"
     echo "  $0 launch --snapshot <name> --no-cloud-init"
