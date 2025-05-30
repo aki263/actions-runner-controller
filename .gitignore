@@ -1,6 +1,6 @@
 # Deploy Assets
 release
-
+firecracker-poc/firecracker-data/
 # Binaries for programs and plugins
 *.exe
 *.exe~
