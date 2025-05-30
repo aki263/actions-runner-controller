@@ -501,6 +501,31 @@ EOF
 }
 EOF
     
+    # Configure kernel modules for Docker networking
+    print_info "Configuring kernel modules for Docker networking..."
+    sudo mkdir -p "${mount_dir}/etc/modules-load.d"
+    sudo tee "${mount_dir}/etc/modules-load.d/docker.conf" > /dev/null <<'EOF'
+# Docker and container networking modules
+overlay
+br_netfilter
+xt_conntrack
+nf_nat
+nf_conntrack
+bridge
+veth
+EOF
+    
+    # Configure sysctl for Docker networking (persistent)
+    sudo mkdir -p "${mount_dir}/etc/sysctl.d"
+    sudo tee "${mount_dir}/etc/sysctl.d/99-docker.conf" > /dev/null <<'EOF'
+# Docker networking configuration
+net.ipv4.ip_forward = 1
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.conf.all.forwarding = 1
+net.ipv6.conf.all.forwarding = 1
+EOF
+    
     # Setup script for runner configuration
     sudo tee "${mount_dir}/usr/local/bin/setup-runner.sh" > /dev/null <<'EOF'
 #!/bin/bash
@@ -1099,6 +1124,25 @@ launch_vm() {
       sleep 5
       usermod -aG docker runner
       
+      # Fix Docker networking issues
+      log \"Configuring Docker networking...\"
+      
+      # Enable IPv4 forwarding (required for Docker networking)
+      echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.conf
+      echo 'net.bridge.bridge-nf-call-iptables = 1' >> /etc/sysctl.conf
+      echo 'net.bridge.bridge-nf-call-ip6tables = 1' >> /etc/sysctl.conf
+      sysctl -p
+      
+      # Load required kernel modules for Docker bridge networking
+      modprobe br_netfilter 2>/dev/null || log \"Warning: br_netfilter module not available\"
+      modprobe xt_conntrack 2>/dev/null || log \"Warning: xt_conntrack module not available\" 
+      modprobe overlay 2>/dev/null || log \"Warning: overlay module not available\"
+      
+      # Restart Docker to pick up networking changes
+      log \"Restarting Docker with updated networking...\"
+      systemctl restart docker
+      sleep 10
+      
       # Configure runner
       log \"Configuring GitHub Actions runner...\"
       cd /opt/runner
@@ -1223,6 +1267,40 @@ MONITOR_EOF
       # Add runner user to docker group
       usermod -aG docker runner
       
+      # Fix Docker networking issues
+      log \"Configuring Docker networking...\"
+      
+      # Enable IPv4 forwarding (required for Docker networking)
+      echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.conf
+      echo 'net.bridge.bridge-nf-call-iptables = 1' >> /etc/sysctl.conf
+      echo 'net.bridge.bridge-nf-call-ip6tables = 1' >> /etc/sysctl.conf
+      sysctl -p
+      
+      # Load required kernel modules for Docker bridge networking
+      modprobe br_netfilter 2>/dev/null || log \"Warning: br_netfilter module not available\"
+      modprobe xt_conntrack 2>/dev/null || log \"Warning: xt_conntrack module not available\" 
+      modprobe overlay 2>/dev/null || log \"Warning: overlay module not available\"
+      
+      # Restart Docker to pick up networking changes
+      log \"Restarting Docker with updated networking...\"
+      systemctl restart docker
+      sleep 10
+      
+      # Verify Docker networking
+      log \"Testing Docker networking...\"
+      if docker network ls | grep bridge >/dev/null; then
+          log \"✅ Docker bridge network available\"
+      else
+          log \"❌ Docker bridge network not found\"
+      fi
+      
+      # Test Docker connectivity
+      if docker run --rm alpine:latest sh -c \"echo 'Docker networking test'\" >/dev/null 2>&1; then
+          log \"✅ Docker networking functional\"
+      else
+          log \"⚠️  Docker networking may have issues\"
+      fi
+      
       # Configure and start runner in Docker mode
       log \"Configuring runner in Docker mode...\"
       cd /opt/runner
@@ -1274,21 +1352,40 @@ MONITOR_EOF
 
       # Add runner user to docker group
       usermod -aG docker runner
-
+      
+      # Fix Docker networking issues
+      log \"Configuring Docker networking...\"
+      
+      # Enable IPv4 forwarding (required for Docker networking)
+      echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.conf
+      echo 'net.bridge.bridge-nf-call-iptables = 1' >> /etc/sysctl.conf
+      echo 'net.bridge.bridge-nf-call-ip6tables = 1' >> /etc/sysctl.conf
+      sysctl -p
+      
+      # Load required kernel modules for Docker bridge networking
+      modprobe br_netfilter 2>/dev/null || log \"Warning: br_netfilter module not available\"
+      modprobe xt_conntrack 2>/dev/null || log \"Warning: xt_conntrack module not available\" 
+      modprobe overlay 2>/dev/null || log \"Warning: overlay module not available\"
+      
+      # Restart Docker to pick up networking changes
+      log \"Restarting Docker with updated networking...\"
+      systemctl restart docker
+      sleep 10
+      
       # Configure runner
       log \"Configuring GitHub Actions runner...\"
       cd /opt/runner
-
+      
       # Remove any existing configuration
       if [ -f .runner ]; then
           log \"Removing existing runner configuration...\"
           sudo -u runner ./config.sh remove --token \"\$RUNNER_TOKEN\" || true
       fi
-
+      
       # Create work directory
       mkdir -p /tmp/runner-work
       chown runner:runner /tmp/runner-work
-
+      
       log \"Running runner configuration...\"
       sudo -u runner ./config.sh \\
           --url \"\$GITHUB_URL\" \\
@@ -1297,7 +1394,7 @@ MONITOR_EOF
           --labels \"\${RUNNER_LABELS:-firecracker}\" \\
           --work \"/tmp/runner-work\" \\
           --unattended --replace
-
+      
       # Start systemd service
       log \"Starting GitHub runner service...\"
       systemctl start github-runner
