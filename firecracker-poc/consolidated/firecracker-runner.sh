@@ -350,8 +350,6 @@ launch_vm() {
     local labels="firecracker"
     local use_cloud_init=true
     local custom_kernel=""
-    local use_dhcp=false
-    local no_cloud_init_network=false
     
     # Parse launch arguments
     while [[ $# -gt 0 ]]; do
@@ -364,9 +362,7 @@ launch_vm() {
             --memory) VM_MEMORY="$2"; shift 2 ;;
             --cpus) VM_CPUS="$2"; shift 2 ;;
             --kernel) custom_kernel="$2"; shift 2 ;;
-            --dhcp) use_dhcp=true; shift ;;
             --no-cloud-init) use_cloud_init=false; shift ;;
-            --no-cloud-init-network) no_cloud_init_network=true; shift ;;
             *) print_error "Unknown option: $1"; exit 1 ;;
         esac
     done
@@ -408,112 +404,58 @@ launch_vm() {
     # Generate SSH key
     ssh-keygen -t rsa -b 4096 -f "ssh_key" -N "" -C "$runner_name" >/dev/null 2>&1
     
-    # Setup networking
-    local tap_device="tap-${vm_id}"
+    # Setup shared TAP bridge networking
+    local shared_tap="firecracker-tap0"
+    local bridge="firecracker-br0"
     local vm_ip=""
-    local host_ip=""
+    local gateway_ip="172.16.0.1"
     local subnet_mask="24"
     
-    if [ "$use_dhcp" = true ]; then
-        print_info "Setting up DHCP networking..."
-        
-        # Use broader subnet for DHCP
-        local network_base="172.16.0"
-        host_ip="${network_base}.1"
-        
-        # Setup TAP device
-        sudo ip tuntap add dev "$tap_device" mode tap 2>/dev/null || true
-        sudo ip addr add "${host_ip}/${subnet_mask}" dev "$tap_device" 2>/dev/null || true
-        sudo ip link set dev "$tap_device" up
-        
-        # Check if dnsmasq is available for DHCP
-        if command -v dnsmasq &> /dev/null; then
-            # Kill any existing dnsmasq for this interface
-            sudo pkill -f "dnsmasq.*${tap_device}" 2>/dev/null || true
-            
-            # Start DHCP server (IP range .100-.200)
-            sudo dnsmasq \
-                --interface="$tap_device" \
-                --dhcp-range="${network_base}.100,${network_base}.200,12h" \
-                --dhcp-option=3,"$host_ip" \
-                --dhcp-option=6,8.8.8.8,8.8.4.4 \
-                --pid-file="/tmp/dnsmasq-${tap_device}.pid" \
-                --log-dhcp &
-            
-            vm_ip="dhcp"  # Will be assigned dynamically
-            print_info "DHCP server started on ${tap_device} (range: ${network_base}.100-200)"
-        else
-            print_warning "dnsmasq not found, falling back to static IP"
-            use_dhcp=false
-        fi
+    print_info "Setting up shared bridge networking..."
+    
+    # Generate unique IP for this VM (172.16.0.10-254)
+    local ip_suffix=$((16#$(echo "$vm_id" | sha256sum | head -c 2) % 200 + 10))
+    if [ $ip_suffix -eq 1 ]; then ip_suffix=10; fi  # Avoid gateway IP
+    vm_ip="172.16.0.${ip_suffix}"
+    
+    print_info "Assigned VM IP: $vm_ip"
+    
+    # Create bridge if it doesn't exist
+    if ! ip link show "$bridge" >/dev/null 2>&1; then
+        print_info "Creating bridge: $bridge"
+        sudo ip link add name "$bridge" type bridge
+        sudo ip addr add "${gateway_ip}/${subnet_mask}" dev "$bridge"
+        sudo ip link set dev "$bridge" up
+    else
+        print_info "Using existing bridge: $bridge"
     fi
     
-    if [ "$use_dhcp" = false ]; then
-        print_info "Setting up static IP networking..."
-        
-        # Generate unique IP based on VM ID hash
-        local ip_suffix=$((16#$(echo "$vm_id" | sha256sum | head -c 2) % 200 + 10))
-        if [ $ip_suffix -eq 1 ]; then ip_suffix=10; fi  # Avoid gateway IP
-        
-        vm_ip="172.16.0.${ip_suffix}"
-        host_ip="172.16.0.1"
-        
-        print_info "Assigned static IP: $vm_ip"
-        
-        # Setup TAP device
-        sudo ip tuntap add dev "$tap_device" mode tap 2>/dev/null || true
-        
-        # Check if any interface already has the gateway IP
-        if ! ip addr show | grep -q "172.16.0.1"; then
-            # No gateway configured yet - configure it on this TAP device
-            if sudo ip addr add "${host_ip}/24" dev "$tap_device" 2>/dev/null; then
-                print_info "Configured gateway ${host_ip}/24 on ${tap_device}"
-            else
-                print_warning "Failed to configure gateway on ${tap_device}, trying to find existing gateway"
-            fi
-        else
-            print_info "Gateway 172.16.0.1 already configured on another interface"
-        fi
-        
-        sudo ip link set dev "$tap_device" up
-        
-        # Verify gateway is reachable
-        if ! ip route get 172.16.0.1 >/dev/null 2>&1; then
-            print_warning "Gateway 172.16.0.1 may not be reachable from host"
-        fi
+    # Create shared TAP if it doesn't exist
+    if ! ip link show "$shared_tap" >/dev/null 2>&1; then
+        print_info "Creating shared TAP device: $shared_tap"
+        sudo ip tuntap add dev "$shared_tap" mode tap
+        sudo ip link set dev "$shared_tap" master "$bridge"
+        sudo ip link set dev "$shared_tap" up
+    else
+        print_info "Using existing TAP device: $shared_tap"
     fi
     
-    # Enable forwarding
+    # Enable forwarding and NAT
     sudo sh -c "echo 1 > /proc/sys/net/ipv4/ip_forward"
     local host_iface=$(ip route | grep default | awk '{print $5}' | head -1)
-    sudo iptables -t nat -A POSTROUTING -o "$host_iface" -j MASQUERADE 2>/dev/null || true
+    sudo iptables -t nat -A POSTROUTING -s 172.16.0.0/24 -o "$host_iface" -j MASQUERADE 2>/dev/null || true
+    sudo iptables -A FORWARD -i "$bridge" -o "$host_iface" -j ACCEPT 2>/dev/null || true
+    sudo iptables -A FORWARD -i "$host_iface" -o "$bridge" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
     
-    # Configure cloud-init or manual setup
+    # Configure VM (cloud-init or manual setup)
     if [ "$use_cloud_init" = true ]; then
-        # Create cloud-init config with network configuration
+        # Create cloud-init config WITHOUT network configuration
         mkdir -p cloud-init
         
-        if [ "$use_dhcp" = true ]; then
-            # DHCP network config
-            cat > cloud-init/user-data <<EOF
+        cat > cloud-init/user-data <<EOF
 #cloud-config
 hostname: ${runner_name}
 
-$(if [ "$no_cloud_init_network" = false ]; then
-cat << 'NETWORK_EOF'
-# Network configuration (DHCP)
-network:
-  version: 2
-  ethernets:
-    eth0:
-      dhcp4: true
-      nameservers:
-        addresses:
-          - 8.8.8.8
-          - 8.8.4.4
-
-NETWORK_EOF
-fi)
 users:
   - name: runner
     ssh_authorized_keys:
@@ -532,122 +474,28 @@ write_files:
       GITHUB_URL=${github_url}
       RUNNER_NAME=${runner_name}
       RUNNER_LABELS=${labels}
+  - path: /etc/systemd/network/10-eth0.network
+    content: |
+      [Match]
+      Name=eth0
+
+      [Network]
+      Address=${vm_ip}/${subnet_mask}
+      Gateway=${gateway_ip}
+      DNS=8.8.8.8
+      DNS=8.8.4.4
 
 runcmd:
+  - systemctl enable systemd-networkd
+  - systemctl start systemd-networkd
   - /usr/local/bin/setup-runner.sh
 
 ssh_pwauth: false
 disable_root: false
 EOF
 
-            if [ "$no_cloud_init_network" = false ]; then
-                cat > cloud-init/network-config <<EOF
-version: 2
-ethernets:
-  eth0:
-    dhcp4: true
-    nameservers:
-      addresses:
-        - 8.8.8.8
-        - 8.8.4.4
-EOF
-            else
-                # Create empty network-config when network is disabled
-                echo "{}" > cloud-init/network-config
-            fi
-        else
-            # Static IP network config
-            cat > cloud-init/user-data <<EOF
-#cloud-config
-hostname: ${runner_name}
-
-$(if [ "$no_cloud_init_network" = false ]; then
-cat << 'NETWORK_EOF'
-# Network configuration (Static IP)
-network:
-  version: 2
-  ethernets:
-    eth0:
-      addresses:
-        - ${vm_ip}/24
-      routes:
-        - to: default
-          via: ${host_ip}
-      nameservers:
-        addresses:
-          - 8.8.8.8
-          - 8.8.4.4
-
-NETWORK_EOF
-fi)
-users:
-  - name: runner
-    ssh_authorized_keys:
-      - $(cat ssh_key.pub)
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    shell: /bin/bash
-
-# Disable automatic package updates during boot
-package_update: false
-package_upgrade: false
-
-write_files:
-  - path: /etc/environment
-    content: |
-      GITHUB_TOKEN=${github_token}
-      GITHUB_URL=${github_url}
-      RUNNER_NAME=${runner_name}
-      RUNNER_LABELS=${labels}
-$(if [ "$no_cloud_init_network" = false ]; then
-cat << 'SERVICE_EOF'
-  - path: /etc/systemd/system/setup-network.service
-    content: |
-      [Unit]
-      Description=Setup Network
-      Before=ssh.service
-      After=network.target
-
-      [Service]
-      Type=oneshot
-      ExecStart=/bin/bash -c 'ip addr add ${vm_ip}/24 dev eth0 || true; ip route add default via ${host_ip} || true'
-      RemainAfterExit=yes
-
-      [Install]
-      WantedBy=multi-user.target
-
-SERVICE_EOF
-fi)
-runcmd:
-$(if [ "$no_cloud_init_network" = false ]; then
-echo "  - systemctl enable setup-network"
-echo "  - systemctl start setup-network"
-fi)
-  - /usr/local/bin/setup-runner.sh
-
-ssh_pwauth: false
-disable_root: false
-EOF
-
-            if [ "$no_cloud_init_network" = false ]; then
-                cat > cloud-init/network-config <<EOF
-version: 2
-ethernets:
-  eth0:
-    addresses:
-      - ${vm_ip}/24
-    routes:
-      - to: default
-        via: ${host_ip}
-    nameservers:
-      addresses:
-        - 8.8.8.8
-        - 8.8.4.4
-EOF
-            else
-                # Create empty network-config when network is disabled
-                echo "{}" > cloud-init/network-config
-            fi
-        fi
+        # Empty network-config (no cloud-init networking)
+        echo "{}" > cloud-init/network-config
         
         cat > cloud-init/meta-data <<EOF
 instance-id: ${vm_id}
@@ -657,12 +505,12 @@ EOF
         # Create cloud-init ISO
         genisoimage -output cloud-init.iso -volid cidata -joliet -rock cloud-init/user-data cloud-init/meta-data cloud-init/network-config >/dev/null 2>&1
         
-        print_info "Cloud-init enabled - runner will auto-configure"
+        print_info "Cloud-init enabled with manual network config"
     else
-        # No cloud-init - create minimal user setup
+        # No cloud-init - manual setup only
         print_info "Cloud-init disabled - manual SSH access only"
         
-        # Mount and add SSH key manually
+        # Mount and configure network manually
         local mount_dir="rootfs_mount"
         mkdir -p "$mount_dir"
         sudo mount -o loop rootfs.ext4 "$mount_dir"
@@ -678,43 +526,30 @@ EOF
         sudo chroot "$mount_dir" chmod 700 /home/runner/.ssh
         sudo chroot "$mount_dir" chmod 600 /home/runner/.ssh/authorized_keys
         
-        if [ "$use_dhcp" = true ]; then
-            # Configure DHCP
-            sudo tee "${mount_dir}/etc/systemd/network/10-eth0.network" > /dev/null <<EOF
+        # Configure static IP via systemd-networkd
+        sudo tee "${mount_dir}/etc/systemd/network/10-eth0.network" > /dev/null <<EOF
 [Match]
 Name=eth0
 
 [Network]
-DHCP=yes
+Address=${vm_ip}/${subnet_mask}
+Gateway=${gateway_ip}
 DNS=8.8.8.8
 DNS=8.8.4.4
 EOF
-        else
-            # Configure static IP
-            sudo tee "${mount_dir}/etc/systemd/network/10-eth0.network" > /dev/null <<EOF
-[Match]
-Name=eth0
-
-[Network]
-Address=${vm_ip}/24
-Gateway=${host_ip}
-DNS=8.8.8.8
-DNS=8.8.4.4
-EOF
-        fi
         
-        # Enable systemd-networkd
-        sudo chroot "$mount_dir" systemctl enable systemd-networkd
-        sudo chroot "$mount_dir" systemctl enable ssh
+        # Enable systemd-networkd and SSH
+        sudo chroot "$mount_dir" systemctl enable systemd-networkd ssh
         
         sudo umount "$mount_dir"
         rmdir "$mount_dir"
         
-        # Create empty cloud-init ISO to satisfy Firecracker
+        # Create minimal cloud-init ISO (required by Firecracker)
         mkdir -p cloud-init
         echo "{}" > cloud-init/user-data
         echo "instance-id: ${vm_id}" > cloud-init/meta-data
-        genisoimage -output cloud-init.iso -volid cidata -joliet -rock cloud-init/user-data cloud-init/meta-data >/dev/null 2>&1
+        echo "{}" > cloud-init/network-config
+        genisoimage -output cloud-init.iso -volid cidata -joliet -rock cloud-init/user-data cloud-init/meta-data cloud-init/network-config >/dev/null 2>&1
     fi
     
     # Setup kernel
@@ -765,7 +600,7 @@ EOF
     
     curl -X PUT --unix-socket "$socket_path" \
         -H "Content-Type: application/json" \
-        -d "{\"iface_id\": \"eth0\", \"guest_mac\": \"06:00:AC:10:00:02\", \"host_dev_name\": \"$tap_device\"}" \
+        -d "{\"iface_id\": \"eth0\", \"guest_mac\": \"06:00:AC:10:00:02\", \"host_dev_name\": \"$shared_tap\"}" \
         http://localhost/network-interfaces/eth0 >/dev/null
     
     # Start VM
@@ -777,6 +612,7 @@ EOF
     print_info "✅ VM started: $runner_name"
     print_info "   VM ID: $vm_id"
     print_info "   IP: $vm_ip"
+    print_info "   Bridge: $bridge (${gateway_ip}/${subnet_mask})"
     print_info "   SSH: ssh -i $(pwd)/ssh_key runner@$vm_ip"
     
     # Save instance info
@@ -785,6 +621,8 @@ EOF
   "name": "$runner_name",
   "vm_id": "$vm_id",
   "ip": "$vm_ip",
+  "bridge": "$bridge",
+  "tap": "$shared_tap",
   "github_url": "$github_url",
   "labels": "$labels",
   "created": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
@@ -792,7 +630,7 @@ EOF
 }
 EOF
     
-    # Wait for SSH
+    # Wait for VM to be ready
     print_info "Waiting for VM to be ready..."
     for i in {1..30}; do
         if ping -c 1 -W 2 "$vm_ip" >/dev/null 2>&1; then
@@ -892,16 +730,29 @@ cleanup() {
     # Stop all instances
     stop_instances
     
-    # Clean up DHCP servers
-    print_info "Stopping DHCP servers..."
-    sudo pkill -f "dnsmasq.*tap-" 2>/dev/null || true
-    rm -f /tmp/dnsmasq-tap-*.pid 2>/dev/null || true
+    # Clean up shared bridge and TAP
+    local shared_tap="firecracker-tap0"
+    local bridge="firecracker-br0"
     
-    # Clean up TAP devices
-    for tap in $(ip link show | grep -o 'tap-[a-f0-9]*' || true); do
-        print_info "Removing TAP device: $tap"
-        sudo ip link del "$tap" 2>/dev/null || true
-    done
+    print_info "Cleaning up shared networking..."
+    
+    # Remove shared TAP device
+    if ip link show "$shared_tap" >/dev/null 2>&1; then
+        print_info "Removing shared TAP device: $shared_tap"
+        sudo ip link del "$shared_tap" 2>/dev/null || true
+    fi
+    
+    # Remove bridge
+    if ip link show "$bridge" >/dev/null 2>&1; then
+        print_info "Removing bridge: $bridge"
+        sudo ip link del "$bridge" 2>/dev/null || true
+    fi
+    
+    # Clean up iptables rules (try to remove, ignore errors)
+    print_info "Cleaning up iptables rules..."
+    sudo iptables -t nat -D POSTROUTING -s 172.16.0.0/24 -j MASQUERADE 2>/dev/null || true
+    sudo iptables -D FORWARD -i "$bridge" -j ACCEPT 2>/dev/null || true
+    sudo iptables -D FORWARD -o "$bridge" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
     
     # Remove instances
     if [ -d "instances" ]; then
@@ -936,9 +787,7 @@ usage() {
     echo "  --memory <mb>             VM memory (default: 2048)"
     echo "  --cpus <count>            VM CPUs (default: 2)"
     echo "  --kernel <path>           Use custom kernel (default: download official)"
-    echo "  --dhcp                    Use DHCP for IP assignment (default: static)"
     echo "  --no-cloud-init           Disable cloud-init for manual testing"
-    echo "  --no-cloud-init-network   Disable network configuration in cloud-init while keeping other cloud-init features"
     echo ""
     echo "Examples:"
     echo "  $0 build"
@@ -946,19 +795,14 @@ usage() {
     echo "  $0 launch --github-url https://github.com/org/repo --github-token ghp_xxx"
     echo "  $0 launch --snapshot prod-v1 --no-cloud-init --name test-vm"
     echo "  $0 launch --kernel ./custom-vmlinux --snapshot prod-v1 --no-cloud-init"
-    echo "  $0 launch --dhcp --snapshot prod-v1 --no-cloud-init --name dhcp-test"
-    echo "  $0 launch --no-cloud-init-network --snapshot prod-v1 --github-url https://github.com/org/repo --github-token ghp_xxx"
     echo "  $0 stop test-vm"
     echo "  $0 stop runner-.*"
     echo "  $0 cleanup"
     echo ""
-    echo "Networking options:"
-    echo "  Static IP: Each VM gets unique IP (172.16.0.10-210)"
-    echo "  DHCP:      Requires dnsmasq, IPs assigned dynamically (172.16.0.100-200)"
-    echo ""
-    echo "Cloud-init options:"
-    echo "  --no-cloud-init:         Disable cloud-init completely"
-    echo "  --no-cloud-init-network: Keep cloud-init but disable network config"
+    echo "Networking:"
+    echo "  All VMs connect to shared bridge 'firecracker-br0' with gateway 172.16.0.1/24"
+    echo "  Each VM gets unique static IP (172.16.0.10-254)"
+    echo "  Network configuration handled via systemd-networkd (not cloud-init)"
     echo ""
     echo "Testing without cloud-init:"
     echo "  $0 launch --snapshot <name> --no-cloud-init"
