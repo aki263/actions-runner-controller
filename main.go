@@ -339,6 +339,20 @@ func main() {
 			os.Exit(1)
 		}
 
+		// Add Firecracker controller for RunnerDeployments
+		runnerDeploymentFirecrackerReconciler := &actionssummerwindnet.RunnerDeploymentFirecrackerReconciler{
+			Client:                mgr.GetClient(),
+			Log:                   log.WithName("runnerdeployment-firecracker"),
+			Scheme:                mgr.GetScheme(),
+			GitHubClient:          multiClient,
+			FirecrackerScriptPath: "/opt/firecracker/firecracker-complete.sh", // Default path
+		}
+
+		if err = runnerDeploymentFirecrackerReconciler.SetupWithManager(mgr); err != nil {
+			log.Error(err, "unable to create controller", "controller", "RunnerDeploymentFirecracker")
+			os.Exit(1)
+		}
+
 		runnerSetReconciler := &actionssummerwindnet.RunnerSetReconciler{
 			Client:             mgr.GetClient(),
 			Log:                log.WithName("runnerset"),

@@ -80,6 +80,10 @@ type RunnerConfig struct {
 	ContainerMode string `json:"containerMode,omitempty"`
 
 	GitHubAPICredentialsFrom *GitHubAPICredentialsFrom `json:"githubAPICredentialsFrom,omitempty"`
+
+	// Runtime configuration for the runner (kubernetes or firecracker)
+	// +optional
+	Runtime *RuntimeConfig `json:"runtime,omitempty"`
 }
 
 type GitHubAPICredentialsFrom struct {
@@ -357,6 +361,41 @@ func (w *WorkVolumeClaimTemplate) V1VolumeMount(mountPath string) corev1.VolumeM
 		MountPath: mountPath,
 		Name:      "work",
 	}
+}
+
+// RuntimeConfig defines the runtime environment for runners
+type RuntimeConfig struct {
+	// Type specifies the runtime type: "kubernetes" (default) or "firecracker"
+	// +optional
+	// +kubebuilder:validation:Enum=kubernetes;firecracker
+	Type string `json:"type,omitempty"`
+
+	// Firecracker configuration (only used when Type is "firecracker")
+	// +optional
+	Firecracker *FirecrackerRuntimeConfig `json:"firecracker,omitempty"`
+}
+
+// FirecrackerRuntimeConfig defines Firecracker-specific configuration
+type FirecrackerRuntimeConfig struct {
+	// KernelImagePath is the path to the kernel image
+	// +optional
+	KernelImagePath string `json:"kernelImagePath,omitempty"`
+
+	// RootfsImagePath is the path to the rootfs image
+	// +optional
+	RootfsImagePath string `json:"rootfsImagePath,omitempty"`
+
+	// Memory allocation for the VM in MiB (default: 2048)
+	// +optional
+	MemoryMiB *int `json:"memoryMiB,omitempty"`
+
+	// Number of vCPUs for the VM (default: 2)
+	// +optional
+	VCPUs *int `json:"vcpus,omitempty"`
+
+	// NetworkConfig for the VM
+	// +optional
+	NetworkConfig *FirecrackerNetworkConfig `json:"networkConfig,omitempty"`
 }
 
 // +kubebuilder:object:root=true
