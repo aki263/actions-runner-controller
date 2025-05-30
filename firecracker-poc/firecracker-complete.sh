@@ -848,6 +848,29 @@ launch_vm() {
     if [ "$use_cloud_init" = true ]; then
         mkdir -p cloud-init
         
+        # Create network configuration content based on approach
+        local network_config=""
+        if [ "$use_dhcp" = true ]; then
+            network_config="
+      [Match]
+      Name=eth0
+      
+      [Network]
+      DHCP=yes
+      DNS=8.8.8.8
+      DNS=8.8.4.4"
+        else
+            network_config="
+      [Match]
+      Name=eth0
+      
+      [Network]
+      Address=${vm_ip}/24
+      Gateway=${gateway_ip}
+      DNS=8.8.8.8
+      DNS=8.8.4.4"
+        fi
+        
         cat > cloud-init/user-data <<EOF
 #cloud-config
 hostname: ${runner_name}
@@ -866,6 +889,24 @@ write_files:
       GITHUB_URL=${github_url}
       RUNNER_NAME=${runner_name}
       RUNNER_LABELS=${labels}
+  - path: /usr/local/bin/run-with-env.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      export GITHUB_TOKEN="${github_token}"
+      export GITHUB_URL="${github_url}"
+      export RUNNER_NAME="${runner_name}"
+      export RUNNER_LABELS="${labels}"
+      exec /usr/local/bin/setup-runner.sh
+  - path: /etc/systemd/network/10-eth0.network
+    content: |${network_config}
+
+runcmd:
+  - systemctl enable systemd-networkd
+  - systemctl restart systemd-networkd
+  - /usr/local/bin/run-with-env.sh
+
+ssh_pwauth: false
 EOF
 
         # Add network configuration based on networking approach
@@ -897,17 +938,6 @@ EOF
       DNS=8.8.4.4
 EOF
         fi
-        
-        # Add the common runcmd section
-        cat >> cloud-init/user-data <<'EOF'
-
-runcmd:
-  - systemctl enable systemd-networkd
-  - systemctl restart systemd-networkd
-  - /usr/local/bin/setup-runner.sh
-
-ssh_pwauth: false
-EOF
         
         echo "{}" > cloud-init/network-config
         echo "instance-id: ${vm_id}" > cloud-init/meta-data
