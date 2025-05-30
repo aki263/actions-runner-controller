@@ -463,17 +463,24 @@ launch_vm() {
         # Setup TAP device
         sudo ip tuntap add dev "$tap_device" mode tap 2>/dev/null || true
         
-        # Check if gateway IP is already configured on any interface
-        if ! ip addr show | grep -q "172.16.0.1/24"; then
-            # First TAP device - configure the gateway
-            sudo ip addr add "${host_ip}/24" dev "$tap_device" 2>/dev/null || true
-            print_info "Configured gateway ${host_ip}/24 on ${tap_device}"
+        # Check if any interface already has the gateway IP
+        if ! ip addr show | grep -q "172.16.0.1"; then
+            # No gateway configured yet - configure it on this TAP device
+            if sudo ip addr add "${host_ip}/24" dev "$tap_device" 2>/dev/null; then
+                print_info "Configured gateway ${host_ip}/24 on ${tap_device}"
+            else
+                print_warning "Failed to configure gateway on ${tap_device}, trying to find existing gateway"
+            fi
         else
-            # Additional TAP devices - just bring up without IP
-            print_info "Gateway already configured, just bringing up ${tap_device}"
+            print_info "Gateway 172.16.0.1 already configured on another interface"
         fi
         
         sudo ip link set dev "$tap_device" up
+        
+        # Verify gateway is reachable
+        if ! ip route get 172.16.0.1 >/dev/null 2>&1; then
+            print_warning "Gateway 172.16.0.1 may not be reachable from host"
+        fi
     fi
     
     # Enable forwarding
