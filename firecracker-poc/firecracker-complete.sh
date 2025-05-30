@@ -228,6 +228,12 @@ build_kernel() {
     print_info "  Size: ${size}"
 }
 
+# Generate random MAC address
+generate_random_mac() {
+    printf "06:%02x:%02x:%02x:%02x:%02x\n" \
+        $((RANDOM % 256)) $((RANDOM % 256)) $((RANDOM % 256)) $((RANDOM % 256)) $((RANDOM % 256))
+}
+
 # Build Ubuntu 24.04 runner filesystem with all packages
 build_filesystem() {
     local rebuild_fs=false
@@ -550,6 +556,8 @@ launch_vm() {
     local labels="firecracker"
     local use_cloud_init=true
     local custom_kernel=""
+    local use_host_bridge=false
+    local use_dhcp=false
     
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -563,6 +571,7 @@ launch_vm() {
             --cpus) VM_CPUS="$2"; shift 2 ;;
             --kernel) custom_kernel="$2"; shift 2 ;;
             --no-cloud-init) use_cloud_init=false; shift ;;
+            --use-host-bridge) use_host_bridge=true; shift ;;
             --skip-deps) skip_deps=true; shift ;;
             *) print_error "Unknown option: $1"; exit 1 ;;
         esac
@@ -613,54 +622,99 @@ launch_vm() {
     # Generate SSH key
     ssh-keygen -t rsa -b 4096 -f "ssh_key" -N "" -C "$runner_name" >/dev/null 2>&1
     
-    # Setup shared bridge networking
-    local bridge="fc-br0"
-    local tap="fc-tap0"
-    local gateway_ip="172.16.0.1"
-    local ip_suffix=$((16#$(echo "$vm_id" | sha256sum | head -c 2) % 200 + 10))
-    if [ $ip_suffix -eq 1 ]; then ip_suffix=10; fi
-    local vm_ip="172.16.0.${ip_suffix}"
+    # Generate random MAC address for this VM
+    local vm_mac=$(generate_random_mac)
     
-    print_info "Setting up networking: $vm_ip via $bridge"
+    # Setup networking based on selected approach
+    local bridge_device=""
+    local tap_device=""
+    local vm_ip=""
+    local gateway_ip=""
     
-    # Create bridge if needed
-    if ! ip link show "$bridge" >/dev/null 2>&1; then
-        print_info "Creating bridge: $bridge"
-        sudo ip link add name "$bridge" type bridge 2>/dev/null || {
-            print_error "Failed to create bridge $bridge"
+    if [ "$use_host_bridge" = true ]; then
+        # Use host bridge approach with DHCP
+        bridge_device="br0"
+        tap_device="tap-${vm_id}"
+        use_dhcp=true
+        
+        print_info "Setting up host bridge networking via $bridge_device (DHCP)"
+        
+        # Check if host bridge exists
+        if ! ip link show "$bridge_device" >/dev/null 2>&1; then
+            print_error "Host bridge $bridge_device not found. Please create it first or use default networking."
+            print_info "To create host bridge: sudo ip link add name br0 type bridge && sudo ip link set br0 up"
             exit 1
-        }
-        sudo ip addr add "${gateway_ip}/24" dev "$bridge" 2>/dev/null || {
-            print_error "Failed to assign IP to bridge $bridge"
-            exit 1
-        }
-        sudo ip link set dev "$bridge" up 2>/dev/null || {
-            print_error "Failed to bring up bridge $bridge"
-            exit 1
-        }
+        fi
+        
+        # Create unique TAP device for this VM
+        if ! ip link show "$tap_device" >/dev/null 2>&1; then
+            print_info "Creating TAP device: $tap_device"
+            sudo ip tuntap add dev "$tap_device" mode tap 2>/dev/null || {
+                print_error "Failed to create TAP device $tap_device"
+                exit 1
+            }
+            sudo ip link set dev "$tap_device" master "$bridge_device" 2>/dev/null || {
+                print_error "Failed to attach TAP device to bridge"
+                exit 1
+            }
+            sudo ip link set dev "$tap_device" up 2>/dev/null || {
+                print_error "Failed to bring up TAP device $tap_device"
+                exit 1
+            }
+        fi
+        
+        print_info "VM will get IP via DHCP from host network"
+        
+    else
+        # Use original static IP approach
+        bridge_device="fc-br0"
+        tap_device="fc-tap0"
+        gateway_ip="172.16.0.1"
+        local ip_suffix=$((16#$(echo "$vm_id" | sha256sum | head -c 2) % 200 + 10))
+        if [ $ip_suffix -eq 1 ]; then ip_suffix=10; fi
+        vm_ip="172.16.0.${ip_suffix}"
+        
+        print_info "Setting up static networking: $vm_ip via $bridge_device"
+        
+        # Create bridge if needed
+        if ! ip link show "$bridge_device" >/dev/null 2>&1; then
+            print_info "Creating bridge: $bridge_device"
+            sudo ip link add name "$bridge_device" type bridge 2>/dev/null || {
+                print_error "Failed to create bridge $bridge_device"
+                exit 1
+            }
+            sudo ip addr add "${gateway_ip}/24" dev "$bridge_device" 2>/dev/null || {
+                print_error "Failed to assign IP to bridge $bridge_device"
+                exit 1
+            }
+            sudo ip link set dev "$bridge_device" up 2>/dev/null || {
+                print_error "Failed to bring up bridge $bridge_device"
+                exit 1
+            }
+        fi
+        
+        # Create shared TAP if needed
+        if ! ip link show "$tap_device" >/dev/null 2>&1; then
+            print_info "Creating TAP device: $tap_device"
+            sudo ip tuntap add dev "$tap_device" mode tap 2>/dev/null || {
+                print_error "Failed to create TAP device $tap_device"
+                exit 1
+            }
+            sudo ip link set dev "$tap_device" master "$bridge_device" 2>/dev/null || {
+                print_error "Failed to attach TAP device to bridge"
+                exit 1
+            }
+            sudo ip link set dev "$tap_device" up 2>/dev/null || {
+                print_error "Failed to bring up TAP device $tap_device"
+                exit 1
+            }
+        fi
+        
+        # Enable NAT for static approach
+        sudo sh -c "echo 1 > /proc/sys/net/ipv4/ip_forward"
+        local host_iface=$(ip route | grep default | awk '{print $5}' | head -1)
+        sudo iptables -t nat -A POSTROUTING -s 172.16.0.0/24 -o "$host_iface" -j MASQUERADE 2>/dev/null || true
     fi
-    
-    # Create shared TAP if needed
-    if ! ip link show "$tap" >/dev/null 2>&1; then
-        print_info "Creating TAP device: $tap"
-        sudo ip tuntap add dev "$tap" mode tap 2>/dev/null || {
-            print_error "Failed to create TAP device $tap"
-            exit 1
-        }
-        sudo ip link set dev "$tap" master "$bridge" 2>/dev/null || {
-            print_error "Failed to attach TAP device to bridge"
-            exit 1
-        }
-        sudo ip link set dev "$tap" up 2>/dev/null || {
-            print_error "Failed to bring up TAP device $tap"
-            exit 1
-        }
-    fi
-    
-    # Enable NAT
-    sudo sh -c "echo 1 > /proc/sys/net/ipv4/ip_forward"
-    local host_iface=$(ip route | grep default | awk '{print $5}' | head -1)
-    sudo iptables -t nat -A POSTROUTING -s 172.16.0.0/24 -o "$host_iface" -j MASQUERADE 2>/dev/null || true
     
     # Setup cloud-init
     if [ "$use_cloud_init" = true ]; then
@@ -684,6 +738,25 @@ write_files:
       GITHUB_URL=${github_url}
       RUNNER_NAME=${runner_name}
       RUNNER_LABELS=${labels}
+EOF
+
+        # Add network configuration based on networking approach
+        if [ "$use_dhcp" = true ]; then
+            # DHCP configuration for host bridge networking
+            cat >> cloud-init/user-data <<'EOF'
+  - path: /etc/systemd/network/10-eth0.network
+    content: |
+      [Match]
+      Name=eth0
+      
+      [Network]
+      DHCP=yes
+      DNS=8.8.8.8
+      DNS=8.8.4.4
+EOF
+        else
+            # Static IP configuration
+            cat >> cloud-init/user-data <<EOF
   - path: /etc/systemd/network/10-eth0.network
     content: |
       [Match]
@@ -694,6 +767,11 @@ write_files:
       Gateway=${gateway_ip}
       DNS=8.8.8.8
       DNS=8.8.4.4
+EOF
+        fi
+        
+        # Add the common runcmd section
+        cat >> cloud-init/user-data <<'EOF'
 
 runcmd:
   - systemctl enable systemd-networkd
@@ -765,7 +843,7 @@ EOF
     
     curl -X PUT --unix-socket "$socket_path" \
         -H "Content-Type: application/json" \
-        -d "{\"iface_id\": \"eth0\", \"guest_mac\": \"06:00:AC:10:00:02\", \"host_dev_name\": \"$tap\"}" \
+        -d "{\"iface_id\": \"eth0\", \"guest_mac\": \"${vm_mac}\", \"host_dev_name\": \"$tap_device\"}" \
         http://localhost/network-interfaces/eth0 >/dev/null
     
     # Start VM
@@ -776,15 +854,26 @@ EOF
     
     print_info "✅ VM started: $runner_name"
     print_info "   VM ID: $vm_id"
-    print_info "   IP: $vm_ip"
-    print_info "   SSH: ssh -i $(pwd)/ssh_key runner@$vm_ip"
+    if [ "$use_dhcp" = true ]; then
+        print_info "   Networking: DHCP via host bridge $bridge_device"
+        print_info "   MAC: $vm_mac"
+        print_info "   SSH: ssh -i $(pwd)/ssh_key runner@<dhcp-assigned-ip>"
+        print_info "   Note: Check your DHCP server logs or network scanner for assigned IP"
+    else
+        print_info "   IP: $vm_ip (static)"
+        print_info "   SSH: ssh -i $(pwd)/ssh_key runner@$vm_ip"
+    fi
     
     # Save instance info
     cat > info.json <<EOF
 {
   "name": "$runner_name",
   "vm_id": "$vm_id", 
-  "ip": "$vm_ip",
+  "ip": "${vm_ip:-dhcp}",
+  "mac": "$vm_mac",
+  "networking": "${use_dhcp:+dhcp}${use_dhcp:-static}",
+  "bridge": "$bridge_device",
+  "tap": "$tap_device",
   "github_url": "$github_url",
   "labels": "$labels",
   "created": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
@@ -863,12 +952,17 @@ list_vms() {
             if [ -f "$inst" ]; then
                 local name=$(jq -r '.name' "$inst")
                 local ip=$(jq -r '.ip' "$inst") 
+                local mac=$(jq -r '.mac // "unknown"' "$inst")
+                local networking=$(jq -r '.networking // "static"' "$inst")
+                local bridge=$(jq -r '.bridge // "unknown"' "$inst")
+                local tap=$(jq -r '.tap // "unknown"' "$inst")
                 local pid=$(jq -r '.pid' "$inst")
                 local github_url=$(jq -r '.github_url // "none"' "$inst")
                 local labels=$(jq -r '.labels // "none"' "$inst")
                 
                 if kill -0 "$pid" 2>/dev/null; then
-                    echo "  ✅ $name - $ip (PID: $pid)"
+                    echo "  ✅ $name - $ip ($networking)"
+                    echo "     MAC: $mac, Bridge: $bridge, TAP: $tap"
                     echo "     GitHub: $github_url"
                     echo "     Labels: $labels"
                 else
@@ -937,6 +1031,22 @@ cleanup() {
     
     # Cleanup networking
     print_info "Cleaning up networking..."
+    
+    # Clean up per-VM TAP devices (host bridge approach)
+    if [ -d "instances" ]; then
+        for inst in instances/*/info.json; do
+            if [ -f "$inst" ]; then
+                local tap=$(jq -r '.tap // ""' "$inst")
+                local networking=$(jq -r '.networking // "static"' "$inst")
+                if [ -n "$tap" ] && [ "$networking" = "dhcp" ]; then
+                    print_info "Removing TAP device: $tap"
+                    sudo ip link del "$tap" 2>/dev/null || true
+                fi
+            fi
+        done
+    fi
+    
+    # Clean up default static networking devices
     sudo ip link del "fc-tap0" 2>/dev/null || true
     sudo ip link del "fc-br0" 2>/dev/null || true
     sudo iptables -t nat -D POSTROUTING -s 172.16.0.0/24 -j MASQUERADE 2>/dev/null || true
@@ -948,6 +1058,7 @@ cleanup() {
     fi
     
     print_info "✅ Cleanup complete"
+    print_info "Note: Host bridge 'br0' (if used) is left intact"
 }
 
 # Usage
@@ -988,6 +1099,7 @@ usage() {
     echo "  --cpus <count>            VM CPU count (default: 2)"
     echo "  --kernel <path>           Custom kernel path"
     echo "  --no-cloud-init           Disable cloud-init"
+    echo "  --use-host-bridge         Use host bridge networking"
     echo "  --skip-deps               Skip dependency checks"
     echo ""
     echo "Examples:"
@@ -1000,6 +1112,7 @@ usage() {
     echo "  $0 build-fs --skip-deps            # Build without dependency checks"
     echo "  $0 snapshot prod-v1                # Create production snapshot"
     echo "  $0 launch --github-url https://github.com/org/repo --github-token ghp_xxx"
+    echo "  $0 launch --use-host-bridge --github-url https://github.com/org/repo --github-token ghp_xxx"
     echo "  $0 launch --skip-deps --no-cloud-init --name test  # Quick test"
     echo "  $0 list                            # Show all resources"
     echo "  $0 cleanup                         # Stop everything"
