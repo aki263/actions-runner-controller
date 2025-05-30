@@ -3512,6 +3512,78 @@ CONFIG_ARCH_USE_MEMTEST=y
 # CONFIG_MEMTEST is not set
 # end of Kernel Testing and Coverage
 
+# Kernel Config Patch for Ubuntu 24.04 Package Support
+# Apply this to your working-kernel-config
+
+# CRITICAL - USB Support (currently disabled)
+CONFIG_USB=y
+CONFIG_USB_SUPPORT=y
+CONFIG_USB_ARCH_HAS_HCD=y
+CONFIG_USB_OHCI_HCD=y
+CONFIG_USB_EHCI_HCD=y
+CONFIG_USB_XHCI_HCD=y
+CONFIG_USB_STORAGE=y
+CONFIG_USB_HID=y
+
+# CRITICAL - Block Device Support
+CONFIG_BLK_DEV_SD=y
+CONFIG_ATA=y  
+CONFIG_SATA_AHCI=y
+CONFIG_SCSI_SCAN_ASYNC=y
+
+# CRITICAL - TUN/TAP Support (needed for your networking!)
+CONFIG_TUN=y
+
+# CRITICAL - Security (Ubuntu default)
+CONFIG_SECURITY_APPARMOR=y
+CONFIG_DEFAULT_SECURITY_APPARMOR=y
+
+# Graphics Support (browsers, selenium)
+CONFIG_DRM=y
+CONFIG_DRM_I915=y
+CONFIG_DRM_AMDGPU=y
+CONFIG_FB=y
+CONFIG_FB_VESA=y
+CONFIG_VT=y
+CONFIG_VT_CONSOLE=y
+
+# Sound Support (browsers, media tools)
+CONFIG_SOUND=y
+CONFIG_SND=y
+CONFIG_SND_PROC_FS=y
+CONFIG_SND_MIXER_OSS=y
+CONFIG_SND_PCM_OSS=y
+CONFIG_SND_HDA_INTEL=y
+
+# Additional Filesystems
+CONFIG_VFAT_FS=y
+CONFIG_MSDOS_FS=y
+CONFIG_NTFS_FS=y
+CONFIG_ISO9660_FS=y
+CONFIG_UDF_FS=y
+
+# Android Development
+CONFIG_ANDROID_BINDER_IPC=y
+CONFIG_ANDROID=y
+
+# Advanced Networking
+CONFIG_MACVLAN=y
+CONFIG_IPVLAN=y
+CONFIG_WIRELESS=y
+CONFIG_WLAN=y
+
+# Development/Debugging
+CONFIG_FTRACE=y
+CONFIG_DYNAMIC_FTRACE=y
+CONFIG_KPROBES=y
+
+# HID Support (input devices)
+CONFIG_HID_GENERIC=y
+CONFIG_HID_BATTERY_STRENGTH=y
+
+# Additional I/O
+CONFIG_SERIO=y
+CONFIG_SERIO_I8042=y 
 #
 # Rust hacking
 #
