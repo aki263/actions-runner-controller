@@ -1213,11 +1213,163 @@ launch_vm() {
             setup_script_content="#!/bin/bash
       set -euo pipefail
       
-      # Source common functions
-      $(declare -f log)
-      $(declare -f setup_docker_networking)
-      $(declare -f setup_github_runner)
-      $(declare -f handle_job_completion)
+      # Logging function
+      log() {
+          echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] \$1\" | tee -a /var/log/arc-runner.log
+      }
+      
+      # Setup Docker networking
+      setup_docker_networking() {
+          log \"Configuring Docker networking...\"
+          
+          # Enable IPv4 forwarding
+          echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.conf
+          echo 'net.bridge.bridge-nf-call-iptables = 1' >> /etc/sysctl.conf 2>/dev/null || true
+          echo 'net.bridge.bridge-nf-call-ip6tables = 1' >> /etc/sysctl.conf 2>/dev/null || true
+          sysctl -p
+          
+          # Load networking modules with graceful fallback
+          log \"Loading networking modules...\"
+          modprobe br_netfilter 2>/dev/null && log \"✅ br_netfilter loaded\" || log \"⚠️  br_netfilter not available\"
+          modprobe xt_conntrack 2>/dev/null && log \"✅ xt_conntrack loaded\" || log \"⚠️  xt_conntrack not available\" 
+          modprobe overlay 2>/dev/null && log \"✅ overlay loaded\" || log \"⚠️  overlay not available\"
+          modprobe bridge 2>/dev/null && log \"✅ bridge loaded\" || log \"⚠️  bridge not available\"
+          
+          # Setup fallback iptables rules if needed
+          if ! lsmod | grep -q br_netfilter; then
+              log \"Setting up fallback iptables rules for Docker\"
+              iptables -t nat -A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE 2>/dev/null || true
+              iptables -A FORWARD -o docker0 -j ACCEPT 2>/dev/null || true
+              iptables -A FORWARD -i docker0 ! -o docker0 -j ACCEPT 2>/dev/null || true
+          fi
+          
+          # Restart Docker and test
+          log \"Restarting Docker...\"
+          systemctl restart docker
+          sleep 10
+          
+          # Test Docker functionality
+          if timeout 30 docker run --rm alpine:latest echo \"Docker test\" >/dev/null 2>&1; then
+              log \"✅ Docker networking functional\"
+              return 0
+          else
+              log \"⚠️  Docker test failed - continuing anyway\"
+              return 1
+          fi
+      }
+      
+      # Setup GitHub runner
+      setup_github_runner() {
+          local runner_mode=\"\$1\"
+          
+          log \"Configuring GitHub Actions runner in \$runner_mode mode...\"
+          cd /opt/runner
+          
+          # Remove existing config
+          sudo -u runner ./config.sh remove --token \"\$RUNNER_TOKEN\" 2>/dev/null || true
+          
+          # Create work directory
+          mkdir -p /tmp/runner-work
+          chown runner:runner /tmp/runner-work
+          
+          # Configure runner
+          sudo -u runner ./config.sh \\
+              --url \"\$GITHUB_URL\" \\
+              --token \"\$RUNNER_TOKEN\" \\
+              --name \"\${RUNNER_NAME:-\$(hostname)}\" \\
+              --labels \"\${RUNNER_LABELS:-firecracker}\" \\
+              --work \"/tmp/runner-work\" \\
+              --unattended --replace || {
+              log \"ERROR: Runner configuration failed\"
+              return 1
+          }
+          
+          log \"✅ Runner configured successfully\"
+          return 0
+      }
+      
+      # Job completion handling for ephemeral VMs
+      handle_job_completion() {
+          log \"Setting up job completion monitoring...\"
+          
+          cat > /usr/local/bin/monitor-job-completion.sh << 'JOBEOF'
+#!/bin/bash
+set -euo pipefail
+
+# Logging function
+log() {
+    echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] \$1\" | tee -a /var/log/job-monitor.log
+}
+
+LAST_JOB_CHECK=\$(date +%s)
+JOB_RUNNING=false
+
+while true; do
+    # Check if runner worker is active
+    if pgrep -f \"Runner.Worker\" >/dev/null; then
+        if [ \"\$JOB_RUNNING\" = false ]; then
+            log \"Job started - worker process detected\"
+            JOB_RUNNING=true
+        fi
+        LAST_JOB_CHECK=\$(date +%s)
+    else
+        if [ \"\$JOB_RUNNING\" = true ]; then
+            log \"Job completed - worker process finished\"
+            JOB_RUNNING=false
+            
+            # Signal completion for ephemeral VMs
+            if [ \"\${EPHEMERAL_MODE:-false}\" = \"true\" ]; then
+                log \"Ephemeral mode: VM shutting down after job completion\"
+                
+                # Create completion signal
+                echo \"job_completed:\$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > /tmp/ephemeral-cleanup
+                
+                # Give time for logs to flush
+                sleep 5
+                
+                # Shutdown the VM
+                log \"Shutting down VM...\"
+                shutdown -h +1 \"Job completed - ephemeral shutdown\" &
+                exit 0
+            fi
+        fi
+    fi
+    
+    # Check if runner service is still alive
+    if ! systemctl is-active --quiet github-runner; then
+        log \"Runner service stopped - restarting\"
+        systemctl restart github-runner
+        sleep 10
+    fi
+    
+    sleep 5
+done
+JOBEOF
+          
+          chmod +x /usr/local/bin/monitor-job-completion.sh
+          
+          # Create systemd service for job monitoring
+          cat > /etc/systemd/system/job-monitor.service << 'SVCEOF'
+[Unit]
+Description=GitHub Actions Job Completion Monitor
+After=github-runner.service
+Requires=github-runner.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/monitor-job-completion.sh
+Restart=always
+RestartSec=10
+Environment=EPHEMERAL_MODE=\${EPHEMERAL_MODE:-false}
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+          
+          systemctl enable job-monitor
+          log \"✅ Job completion monitoring configured\"
+      }
       
       log \"=== ARC-Mode GitHub Actions Runner Setup ===\"
       
@@ -1255,10 +1407,163 @@ launch_vm() {
             setup_script_content="#!/bin/bash
       set -euo pipefail
       
-      # Source common functions
-      $(declare -f log)
-      $(declare -f setup_docker_networking)
-      $(declare -f setup_github_runner)
+      # Logging function
+      log() {
+          echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] \$1\" | tee -a /var/log/docker-runner.log
+      }
+      
+      # Setup Docker networking
+      setup_docker_networking() {
+          log \"Configuring Docker networking...\"
+          
+          # Enable IPv4 forwarding
+          echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.conf
+          echo 'net.bridge.bridge-nf-call-iptables = 1' >> /etc/sysctl.conf 2>/dev/null || true
+          echo 'net.bridge.bridge-nf-call-ip6tables = 1' >> /etc/sysctl.conf 2>/dev/null || true
+          sysctl -p
+          
+          # Load networking modules with graceful fallback
+          log \"Loading networking modules...\"
+          modprobe br_netfilter 2>/dev/null && log \"✅ br_netfilter loaded\" || log \"⚠️  br_netfilter not available\"
+          modprobe xt_conntrack 2>/dev/null && log \"✅ xt_conntrack loaded\" || log \"⚠️  xt_conntrack not available\" 
+          modprobe overlay 2>/dev/null && log \"✅ overlay loaded\" || log \"⚠️  overlay not available\"
+          modprobe bridge 2>/dev/null && log \"✅ bridge loaded\" || log \"⚠️  bridge not available\"
+          
+          # Setup fallback iptables rules if needed
+          if ! lsmod | grep -q br_netfilter; then
+              log \"Setting up fallback iptables rules for Docker\"
+              iptables -t nat -A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE 2>/dev/null || true
+              iptables -A FORWARD -o docker0 -j ACCEPT 2>/dev/null || true
+              iptables -A FORWARD -i docker0 ! -o docker0 -j ACCEPT 2>/dev/null || true
+          fi
+          
+          # Restart Docker and test
+          log \"Restarting Docker...\"
+          systemctl restart docker
+          sleep 10
+          
+          # Test Docker functionality
+          if timeout 30 docker run --rm alpine:latest echo \"Docker test\" >/dev/null 2>&1; then
+              log \"✅ Docker networking functional\"
+              return 0
+          else
+              log \"⚠️  Docker test failed - continuing anyway\"
+              return 1
+          fi
+      }
+      
+      # Setup GitHub runner
+      setup_github_runner() {
+          local runner_mode=\"\$1\"
+          
+          log \"Configuring GitHub Actions runner in \$runner_mode mode...\"
+          cd /opt/runner
+          
+          # Remove existing config
+          sudo -u runner ./config.sh remove --token \"\$RUNNER_TOKEN\" 2>/dev/null || true
+          
+          # Create work directory
+          mkdir -p /tmp/runner-work
+          chown runner:runner /tmp/runner-work
+          
+          # Configure runner
+          sudo -u runner ./config.sh \\
+              --url \"\$GITHUB_URL\" \\
+              --token \"\$RUNNER_TOKEN\" \\
+              --name \"\${RUNNER_NAME:-\$(hostname)}\" \\
+              --labels \"\${RUNNER_LABELS:-firecracker}\" \\
+              --work \"/tmp/runner-work\" \\
+              --unattended --replace || {
+              log \"ERROR: Runner configuration failed\"
+              return 1
+          }
+          
+          log \"✅ Runner configured successfully\"
+          return 0
+      }
+      
+      # Job completion handling for ephemeral VMs
+      handle_job_completion() {
+          log \"Setting up job completion monitoring...\"
+          
+          cat > /usr/local/bin/monitor-job-completion.sh << 'JOBEOF'
+#!/bin/bash
+set -euo pipefail
+
+# Logging function
+log() {
+    echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] \$1\" | tee -a /var/log/job-monitor.log
+}
+
+LAST_JOB_CHECK=\$(date +%s)
+JOB_RUNNING=false
+
+while true; do
+    # Check if runner worker is active
+    if pgrep -f \"Runner.Worker\" >/dev/null; then
+        if [ \"\$JOB_RUNNING\" = false ]; then
+            log \"Job started - worker process detected\"
+            JOB_RUNNING=true
+        fi
+        LAST_JOB_CHECK=\$(date +%s)
+    else
+        if [ \"\$JOB_RUNNING\" = true ]; then
+            log \"Job completed - worker process finished\"
+            JOB_RUNNING=false
+            
+            # Signal completion for ephemeral VMs
+            if [ \"\${EPHEMERAL_MODE:-false}\" = \"true\" ]; then
+                log \"Ephemeral mode: VM shutting down after job completion\"
+                
+                # Create completion signal
+                echo \"job_completed:\$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > /tmp/ephemeral-cleanup
+                
+                # Give time for logs to flush
+                sleep 5
+                
+                # Shutdown the VM
+                log \"Shutting down VM...\"
+                shutdown -h +1 \"Job completed - ephemeral shutdown\" &
+                exit 0
+            fi
+        fi
+    fi
+    
+    # Check if runner service is still alive
+    if ! systemctl is-active --quiet github-runner; then
+        log \"Runner service stopped - restarting\"
+        systemctl restart github-runner
+        sleep 10
+    fi
+    
+    sleep 5
+done
+JOBEOF
+          
+          chmod +x /usr/local/bin/monitor-job-completion.sh
+          
+          # Create systemd service for job monitoring
+          cat > /etc/systemd/system/job-monitor.service << 'SVCEOF'
+[Unit]
+Description=GitHub Actions Job Completion Monitor
+After=github-runner.service
+Requires=github-runner.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/monitor-job-completion.sh
+Restart=always
+RestartSec=10
+Environment=EPHEMERAL_MODE=\${EPHEMERAL_MODE:-false}
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+          
+          systemctl enable job-monitor
+          log \"✅ Job completion monitoring configured\"
+      }
       
       log \"=== Docker-Mode GitHub Actions Runner Setup ===\"
       
@@ -1288,10 +1593,80 @@ launch_vm() {
             setup_script_content="#!/bin/bash
       set -euo pipefail
 
-      # Source common functions
-      $(declare -f log)
-      $(declare -f setup_docker_networking)
-      $(declare -f setup_github_runner)
+      # Logging function
+      log() {
+          echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] \$1\" | tee -a /var/log/setup-runner.log
+      }
+      
+      # Setup Docker networking
+      setup_docker_networking() {
+          log \"Configuring Docker networking...\"
+          
+          # Enable IPv4 forwarding
+          echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.conf
+          echo 'net.bridge.bridge-nf-call-iptables = 1' >> /etc/sysctl.conf 2>/dev/null || true
+          echo 'net.bridge.bridge-nf-call-ip6tables = 1' >> /etc/sysctl.conf 2>/dev/null || true
+          sysctl -p
+          
+          # Load networking modules with graceful fallback
+          log \"Loading networking modules...\"
+          modprobe br_netfilter 2>/dev/null && log \"✅ br_netfilter loaded\" || log \"⚠️  br_netfilter not available\"
+          modprobe xt_conntrack 2>/dev/null && log \"✅ xt_conntrack loaded\" || log \"⚠️  xt_conntrack not available\" 
+          modprobe overlay 2>/dev/null && log \"✅ overlay loaded\" || log \"⚠️  overlay not available\"
+          modprobe bridge 2>/dev/null && log \"✅ bridge loaded\" || log \"⚠️  bridge not available\"
+          
+          # Setup fallback iptables rules if needed
+          if ! lsmod | grep -q br_netfilter; then
+              log \"Setting up fallback iptables rules for Docker\"
+              iptables -t nat -A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE 2>/dev/null || true
+              iptables -A FORWARD -o docker0 -j ACCEPT 2>/dev/null || true
+              iptables -A FORWARD -i docker0 ! -o docker0 -j ACCEPT 2>/dev/null || true
+          fi
+          
+          # Restart Docker and test
+          log \"Restarting Docker...\"
+          systemctl restart docker
+          sleep 10
+          
+          # Test Docker functionality
+          if timeout 30 docker run --rm alpine:latest echo \"Docker test\" >/dev/null 2>&1; then
+              log \"✅ Docker networking functional\"
+              return 0
+          else
+              log \"⚠️  Docker test failed - continuing anyway\"
+              return 1
+          fi
+      }
+      
+      # Setup GitHub runner
+      setup_github_runner() {
+          local runner_mode=\"\$1\"
+          
+          log \"Configuring GitHub Actions runner in \$runner_mode mode...\"
+          cd /opt/runner
+          
+          # Remove existing config
+          sudo -u runner ./config.sh remove --token \"\$RUNNER_TOKEN\" 2>/dev/null || true
+          
+          # Create work directory
+          mkdir -p /tmp/runner-work
+          chown runner:runner /tmp/runner-work
+          
+          # Configure runner
+          sudo -u runner ./config.sh \\
+              --url \"\$GITHUB_URL\" \\
+              --token \"\$RUNNER_TOKEN\" \\
+              --name \"\${RUNNER_NAME:-\$(hostname)}\" \\
+              --labels \"\${RUNNER_LABELS:-firecracker}\" \\
+              --work \"/tmp/runner-work\" \\
+              --unattended --replace || {
+              log \"ERROR: Runner configuration failed\"
+              return 1
+          }
+          
+          log \"✅ Runner configured successfully\"
+          return 0
+      }
 
       log \"=== Systemd-Mode GitHub Actions Runner Setup ===\"
 
@@ -1342,29 +1717,17 @@ write_files:
     permissions: '0755'
     content: |
 $(echo "$setup_script_content" | sed 's/^/      /')
-  - path: /usr/local/bin/run-with-env.sh
-    permissions: '0755'
-    content: |
-      #!/bin/bash
-      # Security: Only short-lived registration token passed to VM (NOT PAT)
-      export GITHUB_TOKEN="${final_github_token}"
-      export GITHUB_URL="${github_url}"
-      export RUNNER_NAME="${runner_name}"
-      export RUNNER_LABELS="${labels}"
-      export RUNNER_TOKEN="${final_github_token}"
-      exec /usr/local/bin/setup-runner.sh
   - path: /etc/systemd/network/10-eth0.network
     content: |${network_config}
 
 runcmd:
   - systemctl enable systemd-networkd
   - systemctl restart systemd-networkd
-$(if [ "$arc_mode" = true ]; then echo "  - nohup /usr/local/bin/run-with-env.sh > /var/log/arc-runner.log 2>&1 &"; elif [ "$docker_mode" = true ]; then echo "  - nohup /usr/local/bin/run-with-env.sh > /var/log/docker-runner.log 2>&1 &"; else echo "  - /usr/local/bin/run-with-env.sh"; fi)
+$(if [ "$arc_mode" = true ]; then echo "  - nohup /usr/local/bin/setup-runner.sh > /var/log/arc-runner.log 2>&1 &"; elif [ "$docker_mode" = true ]; then echo "  - nohup /usr/local/bin/setup-runner.sh > /var/log/docker-runner.log 2>&1 &"; else echo "  - /usr/local/bin/setup-runner.sh"; fi)
 
 ssh_pwauth: false
 EOF
 
-        
         echo "{}" > cloud-init/network-config
         echo "instance-id: ${vm_id}" > cloud-init/meta-data
         
@@ -1489,396 +1852,650 @@ EOF
     print_warning "VM may still be starting up"
 }
 
-# List and manage VMs
-list_vms() {
-    print_header "Firecracker Resources"
+list_arc_vms() {
+    print_header "ARC Firecracker VMs"
     
-    echo -e "${GREEN}Kernels:${NC}"
-    if [ -d "kernels" ] && ls kernels/vmlinux-* &>/dev/null; then
-        for kernel in kernels/vmlinux-*; do
-            if [ -f "$kernel" ]; then
-                local size=$(du -h "$kernel" | cut -f1)
-                local name=$(basename "$kernel")
-                echo "  $name ($size)"
-            fi
-        done
-    else
-        echo "  None built yet - run: $0 build-kernel"
-    fi
-    echo
-    
-    echo -e "${GREEN}Images:${NC}"
-    if [ -d "images" ] && ls images/*.ext4 &>/dev/null; then
-        for img in images/*.ext4; do
-            if [ -f "$img" ]; then
-                local size=$(du -h "$img" | cut -f1)
-                local name=$(basename "$img")
-                echo "  $name ($size)"
-            fi
-        done
-    else
-        echo "  None built yet - run: $0 build-fs" 
-    fi
-    echo
-    
-    echo -e "${GREEN}Snapshots:${NC}"
-    if [ -d "snapshots" ] && [ "$(ls -A snapshots 2>/dev/null)" ]; then
-        for snap in snapshots/*/info.json; do
-            if [ -f "$snap" ]; then
-                local name=$(jq -r '.name' "$snap")
-                local created=$(jq -r '.created' "$snap")
-                local size=$(jq -r '.image_size // "unknown"' "$snap")
-                local runner_ver=$(jq -r '.runner_version // "unknown"' "$snap")
-                echo "  $name - created: $created, size: $size, runner: v$runner_ver"
-            fi
-        done
-    else
-        echo "  None created yet - run: $0 snapshot <name>"
-    fi
-    echo
-    
-    echo -e "${GREEN}Running VMs:${NC}"
-    if [ -d "instances" ] && [ "$(ls -A instances 2>/dev/null)" ]; then
-        for inst in instances/*/info.json; do
-            if [ -f "$inst" ]; then
-                local name=$(jq -r '.name' "$inst")
-                local ip=$(jq -r '.ip' "$inst") 
-                local mac=$(jq -r '.mac // "unknown"' "$inst")
-                local networking=$(jq -r '.networking // "static"' "$inst")
-                local bridge=$(jq -r '.bridge // "unknown"' "$inst")
-                local tap=$(jq -r '.tap // "unknown"' "$inst")
-                local pid=$(jq -r '.pid' "$inst")
-                local github_url=$(jq -r '.github_url // "none"' "$inst")
-                local labels=$(jq -r '.labels // "none"' "$inst")
-                
-                if kill -0 "$pid" 2>/dev/null; then
-                    echo "  ✅ $name - $ip ($networking)"
-                    echo "     MAC: $mac, Bridge: $bridge, TAP: $tap"
-                    echo "     GitHub: $github_url"
-                    echo "     Labels: $labels"
-                else
-                    echo "  ❌ $name - $ip (stopped)"
-                fi
-            fi
-        done
-    else
-        echo "  None running - run: $0 launch [options]"
+    if [[ ! -d "instances" ]] || [[ -z "$(ls -A instances/ 2>/dev/null)" ]]; then
+        print_info "No ARC VMs found"
+        return 0
     fi
     
-    # Show network status if running on Linux
-    if [[ "$(uname -s)" == "Linux" ]] && command -v ip &> /dev/null; then
-        echo
-        echo -e "${GREEN}Network Status:${NC}"
-        if ip link show fc-br0 >/dev/null 2>&1; then
-            local bridge_ip=$(ip addr show fc-br0 | grep 'inet ' | awk '{print $2}' | head -1)
-            echo "  Bridge: fc-br0 ($bridge_ip) ✅"
+    printf "%-15s %-10s %-15s %-10s %-8s %s\n" "VM_ID" "STATUS" "IP_ADDRESS" "UPTIME" "MEMORY" "TYPE"
+    echo "--------------------------------------------------------------------------------"
+    
+    for instance_dir in instances/*/; do
+        if [[ ! -d "$instance_dir" ]]; then continue; fi
+        
+        local vm_name=$(basename "$instance_dir")
+        local info_file="${instance_dir}/info.json"
+        local socket_path="${instance_dir}/firecracker.socket"
+        
+        if [[ ! -f "$info_file" ]]; then continue; fi
+        
+        local vm_id=$(jq -r '.vm_id // "unknown"' "$info_file" 2>/dev/null || echo "unknown")
+        local vm_type=$(jq -r '.type // "unknown"' "$info_file" 2>/dev/null || echo "unknown")
+        local memory=$(jq -r '.memory // "unknown"' "$info_file" 2>/dev/null || echo "unknown")
+        local pid=$(jq -r '.pid // ""' "$info_file" 2>/dev/null || echo "")
+        
+        local status="unknown"
+        local ip_address="unknown"
+        local uptime="unknown"
+        
+        # Check VM status via API
+        if [[ -S "$socket_path" ]] && curl --unix-socket "$socket_path" -s -X GET "http://localhost/" >/dev/null 2>&1; then
+            status="running"
+            
+            # Calculate uptime from PID
+            if [[ -n "$pid" ]] && ps -p "$pid" >/dev/null 2>&1; then
+                uptime=$(ps -o etime= -p "$pid" | tr -d ' ')
+            fi
+            
+            # Try to get IP from logs
+            local vm_log="${instance_dir}/firecracker.log"
+            if [[ -f "$vm_log" ]]; then
+                ip_address=$(grep -o "inet [0-9.]*" "$vm_log" 2>/dev/null | tail -1 | cut -d' ' -f2 || echo "unknown")
+            fi
         else
-            echo "  Bridge: fc-br0 (not configured)"
+            status="stopped"
         fi
         
-        if ip link show fc-tap0 >/dev/null 2>&1; then
-            echo "  TAP: fc-tap0 ✅"
-        else
-            echo "  TAP: fc-tap0 (not configured)"
+        # Only show ARC VMs
+        if [[ "$vm_type" == "arc-runner" ]]; then
+            printf "%-15s %-10s %-15s %-10s %-8s %s\n" "$vm_id" "$status" "$ip_address" "$uptime" "${memory}MB" "$vm_type"
         fi
+    done
+}
+
+delete_arc_vm() {
+    local vm_id="$1"
+    
+    if [[ -z "$vm_id" ]]; then
+        print_error "VM ID required"
+        return 1
+    fi
+    
+    print_info "🗑️  Deleting ARC VM: $vm_id"
+    
+    local instance_dir="instances/${vm_id}"
+    local socket_path="${instance_dir}/firecracker.socket"
+    local pid_file="${instance_dir}/firecracker.pid"
+    local info_file="${instance_dir}/info.json"
+    
+    if [[ ! -d "$instance_dir" ]]; then
+        print_warning "VM instance directory not found: $instance_dir"
+        return 1
+    fi
+    
+    # Get TAP device from info
+    local tap_device=""
+    if [[ -f "$info_file" ]]; then
+        tap_device=$(jq -r '.tap // ""' "$info_file" 2>/dev/null || echo "")
+    fi
+    
+    # Try graceful shutdown first
+    if [[ -S "$socket_path" ]]; then
+        print_info "📤 Sending shutdown signal..."
+        curl --unix-socket "$socket_path" \
+             -X PUT "http://localhost/actions" \
+             -H "Content-Type: application/json" \
+             -d '{"action_type": "SendCtrlAltDel"}' >/dev/null 2>&1 || true
+        
+        # Wait for graceful shutdown
+        sleep 5
+    fi
+    
+    # Force kill if still running
+    if [[ -f "$pid_file" ]]; then
+        local pid=$(cat "$pid_file")
+        if ps -p "$pid" >/dev/null 2>&1; then
+            print_info "💀 Force killing Firecracker process..."
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+    fi
+    
+    # Cleanup networking
+    if [[ -n "$tap_device" ]]; then
+        print_info "🔗 Cleaning up TAP device: $tap_device"
+        sudo ip link del "$tap_device" 2>/dev/null || true
+    fi
+    
+    # Remove instance directory
+    rm -rf "$instance_dir"
+    
+    print_info "✅ ARC VM $vm_id deleted successfully"
+}
+
+get_arc_vm_status() {
+    local vm_id="$1"
+    
+    if [[ -z "$vm_id" ]]; then
+        print_error "VM ID required"
+        return 1
+    fi
+    
+    local instance_dir="instances/${vm_id}"
+    local socket_path="${instance_dir}/firecracker.socket"
+    
+    if [[ ! -d "$instance_dir" ]]; then
+        echo "not_found"
+        return 0
+    fi
+    
+    if [[ ! -S "$socket_path" ]]; then
+        echo "stopped"
+        return 0
+    fi
+    
+    # Check if API is responsive
+    if curl --unix-socket "$socket_path" -s -X GET "http://localhost/" >/dev/null 2>&1; then
+        echo "running"
+    else
+        echo "error"
     fi
 }
 
-# Stop VMs
-stop_vms() {
-    local pattern="${1:-.*}"
+cleanup_arc_vms() {
+    print_header "Cleaning Up Stopped ARC VMs"
     
-    if [ ! -d "instances" ]; then
-        print_info "No instances found"
-        return
+    local cleaned=0
+    
+    if [[ ! -d "instances" ]]; then
+        print_info "No instances directory found"
+        return 0
     fi
     
-    local stopped=0
-    for inst in instances/*/info.json; do
-        if [ -f "$inst" ]; then
-            local name=$(jq -r '.name' "$inst")
-            local pid=$(jq -r '.pid' "$inst")
+    for instance_dir in instances/*/; do
+        if [[ ! -d "$instance_dir" ]]; then continue; fi
+        
+        local vm_name=$(basename "$instance_dir")
+        local info_file="${instance_dir}/info.json"
+        
+        if [[ ! -f "$info_file" ]]; then continue; fi
+        
+        local vm_type=$(jq -r '.type // "unknown"' "$info_file" 2>/dev/null || echo "unknown")
+        
+        # Only clean ARC VMs
+        if [[ "$vm_type" == "arc-runner" ]]; then
+            local vm_id=$(jq -r '.vm_id // "unknown"' "$info_file" 2>/dev/null || echo "unknown")
+            local status=$(get_arc_vm_status "$vm_id")
             
-            if [[ "$name" =~ $pattern ]]; then
-                if kill -0 "$pid" 2>/dev/null; then
-                    print_info "Stopping $name (PID: $pid)..."
-                    kill "$pid" 2>/dev/null || true
-                    sleep 1
-                    kill -9 "$pid" 2>/dev/null || true
-                    ((stopped++))
-                fi
+            if [[ "$status" != "running" ]]; then
+                print_info "🗑️  Cleaning up stopped VM: $vm_id"
+                delete_arc_vm "$vm_id"
+                ((cleaned++))
             fi
         fi
     done
     
-    [ $stopped -eq 0 ] && print_info "No matching VMs to stop" || print_info "Stopped $stopped VM(s)"
+    print_info "✅ Cleanup complete. Cleaned $cleaned ARC VMs."
+}
+
+setup_vm_networking() {
+    local tap_device="$1"
+    
+    # Create TAP device
+    if ! ip link show "$tap_device" >/dev/null 2>&1; then
+        sudo ip tuntap add "$tap_device" mode tap
+        sudo ip link set "$tap_device" up
+    fi
+    
+    # Check if bridge exists, create if needed
+    if ! ip link show "fc-br0" >/dev/null 2>&1; then
+        print_info "🌐 Setting up bridge networking..."
+        sudo ip link add name "fc-br0" type bridge
+        sudo ip addr add 172.16.0.1/24 dev "fc-br0"
+        sudo ip link set "fc-br0" up
+        
+        # Enable IP forwarding and NAT
+        echo 1 | sudo tee /proc/sys/net/ipv4/ip_forward >/dev/null
+        sudo iptables -t nat -A POSTROUTING -s 172.16.0.0/24 -j MASQUERADE 2>/dev/null || true
+    fi
+    
+    # Add TAP to bridge
+    sudo ip link set "$tap_device" master "fc-br0"
+}
+
+create_cloud_init_iso() {
+    local cloud_init_file="$1"
+    local iso_file="$2"
+    
+    local temp_dir=$(mktemp -d)
+    mkdir -p "$temp_dir/user-data" "$temp_dir/meta-data"
+    
+    # Copy cloud-init data
+    cp "$cloud_init_file" "$temp_dir/user-data"
+    
+    # Create meta-data
+    cat > "$temp_dir/meta-data" << EOF
+instance-id: $(basename "$cloud_init_file" .yml)
+local-hostname: $(basename "$cloud_init_file" .yml)
+EOF
+    
+    # Create ISO
+    if command -v genisoimage >/dev/null 2>&1; then
+        genisoimage -output "$iso_file" -volid cidata -joliet -rock "$temp_dir"/{user-data,meta-data} >/dev/null 2>&1
+    elif command -v mkisofs >/dev/null 2>&1; then
+        mkisofs -output "$iso_file" -volid cidata -joliet -rock "$temp_dir"/{user-data,meta-data} >/dev/null 2>&1
+    else
+        print_error "Neither genisoimage nor mkisofs found"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    
+    rm -rf "$temp_dir"
+}
+
+# List all VMs and resources
+list_vms() {
+    print_header "Firecracker Resources"
+    
+    # Show kernels
+    echo "Kernels:"
+    if [ -d "kernels" ] && [ "$(ls -A kernels/ 2>/dev/null)" ]; then
+        for kernel in kernels/*; do
+            if [ -f "$kernel" ]; then
+                local size=$(du -h "$kernel" | cut -f1)
+                echo "  $(basename "$kernel") (${size})"
+            fi
+        done
+    else
+        echo "  No kernels found"
+    fi
+    echo ""
+    
+    # Show filesystems
+    echo "Filesystems:"
+    if [ -d "images" ] && [ "$(ls -A images/ 2>/dev/null)" ]; then
+        for image in images/*.ext4; do
+            if [ -f "$image" ]; then
+                local size=$(du -h "$image" | cut -f1)
+                echo "  $(basename "$image") (${size})"
+            fi
+        done
+    else
+        echo "  No filesystem images found"
+    fi
+    echo ""
+    
+    # Show snapshots
+    echo "Snapshots:"
+    if [ -d "snapshots" ] && [ "$(ls -A snapshots/ 2>/dev/null)" ]; then
+        for snapshot in snapshots/*/; do
+            if [ -d "$snapshot" ]; then
+                local name=$(basename "$snapshot")
+                local size=$(du -sh "$snapshot" | cut -f1)
+                if [ -f "${snapshot}/info.json" ]; then
+                    local created=$(jq -r '.created // "unknown"' "${snapshot}/info.json" 2>/dev/null)
+                    echo "  $name (${size}, created: $created)"
+                else
+                    echo "  $name (${size})"
+                fi
+            fi
+        done
+    else
+        echo "  No snapshots found"
+    fi
+    echo ""
+    
+    # Show running VMs
+    echo "Running VMs:"
+    if [ -d "instances" ] && [ "$(ls -A instances/ 2>/dev/null)" ]; then
+        printf "%-12s %-10s %-15s %-8s %s\n" "VM_ID" "STATUS" "IP" "UPTIME" "SNAPSHOT"
+        echo "---------------------------------------------------------------"
+        
+        for instance_dir in instances/*/; do
+            if [ -d "$instance_dir" ]; then
+                local vm_id=$(basename "$instance_dir")
+                local info_file="${instance_dir}/info.json"
+                local socket_path="${instance_dir}/firecracker.socket"
+                
+                local status="unknown"
+                local ip="unknown"
+                local uptime="unknown"
+                local snapshot="unknown"
+                
+                if [ -f "$info_file" ]; then
+                    ip=$(jq -r '.ip // "unknown"' "$info_file" 2>/dev/null)
+                    snapshot=$(jq -r '.snapshot // "unknown"' "$info_file" 2>/dev/null)
+                    local pid=$(jq -r '.pid // ""' "$info_file" 2>/dev/null)
+                    
+                    if [ -n "$pid" ] && ps -p "$pid" >/dev/null 2>&1; then
+                        status="running"
+                        uptime=$(ps -o etime= -p "$pid" | tr -d ' ')
+                    elif [ -S "$socket_path" ]; then
+                        status="socket"
+                    else
+                        status="stopped"
+                    fi
+                fi
+                
+                printf "%-12s %-10s %-15s %-8s %s\n" "$vm_id" "$status" "$ip" "$uptime" "$snapshot"
+            fi
+        done
+    else
+        echo "  No running VMs found"
+    fi
+}
+
+# Stop VMs with optional pattern matching
+stop_vms() {
+    local pattern="${1:-.*}"
+    
+    print_header "Stopping VMs"
+    
+    if [ ! -d "instances" ]; then
+        print_info "No instances directory found"
+        return 0
+    fi
+    
+    local stopped=0
+    for instance_dir in instances/*/; do
+        if [ -d "$instance_dir" ]; then
+            local vm_id=$(basename "$instance_dir")
+            
+            if [[ "$vm_id" =~ $pattern ]]; then
+                local socket_path="${instance_dir}/firecracker.socket"
+                local pid_file="${instance_dir}/firecracker.pid"
+                
+                print_info "Stopping VM: $vm_id"
+                
+                # Try graceful shutdown
+                if [ -S "$socket_path" ]; then
+                    curl --unix-socket "$socket_path" \
+                         -X PUT "http://localhost/actions" \
+                         -H "Content-Type: application/json" \
+                         -d '{"action_type": "SendCtrlAltDel"}' >/dev/null 2>&1
+                    sleep 3
+                fi
+                
+                # Force kill if still running
+                if [ -f "$pid_file" ]; then
+                    local pid=$(cat "$pid_file")
+                    if ps -p "$pid" >/dev/null 2>&1; then
+                        kill -9 "$pid" 2>/dev/null
+                    fi
+                fi
+                
+                ((stopped++))
+            fi
+        fi
+    done
+    
+    print_info "Stopped $stopped VMs"
 }
 
 # Check VM status and diagnostics
 check_vm_status() {
-    local vm_pattern="${1:-.*}"
-    
     print_header "VM Status and Diagnostics"
     
     if [ ! -d "instances" ]; then
-        print_info "No instances found"
-        return
+        print_info "No instances directory found"
+        return 0
     fi
     
-    for inst in instances/*/info.json; do
-        if [ -f "$inst" ]; then
-            local name=$(jq -r '.name' "$inst")
-            local ip=$(jq -r '.ip' "$inst")
-            local pid=$(jq -r '.pid' "$inst")
-            local vm_dir=$(dirname "$inst")
+    for instance_dir in instances/*/; do
+        if [ -d "$instance_dir" ]; then
+            local vm_id=$(basename "$instance_dir")
+            local info_file="${instance_dir}/info.json"
+            local socket_path="${instance_dir}/firecracker.socket"
             
-            if [[ "$name" =~ $vm_pattern ]]; then
-                echo
-                echo -e "${GREEN}VM: $name${NC}"
-                echo "================================"
-                
-                # Process status
-                if kill -0 "$pid" 2>/dev/null; then
-                    echo "✅ Firecracker process: Running (PID: $pid)"
-                else
-                    echo "❌ Firecracker process: Stopped"
-                    continue
-                fi
-                
-                # Network connectivity
-                if ping -c 1 -W 2 "$ip" >/dev/null 2>&1; then
-                    echo "✅ Network: Reachable ($ip)"
-                else
-                    echo "❌ Network: Not reachable ($ip)"
-                    continue
-                fi
-                
-                # SSH access
-                if ssh -i "${vm_dir}/ssh_key" -o ConnectTimeout=3 -o StrictHostKeyChecking=no runner@"$ip" 'echo ready' >/dev/null 2>&1; then
-                    echo "✅ SSH: Accessible"
-                    
-                    # Get system status via SSH
-                    echo "📊 System Status:"
-                    ssh -i "${vm_dir}/ssh_key" -o ConnectTimeout=5 -o StrictHostKeyChecking=no runner@"$ip" '
-                        echo "   Uptime: $(uptime | cut -d"," -f1 | cut -d" " -f4-)"
-                        echo "   Load: $(cat /proc/loadavg | cut -d" " -f1-3)"
-                        echo "   Memory: $(free -h | grep Mem | awk "{print \$3\"/\"\$2}")"
-                        echo "   Disk: $(df -h / | tail -1 | awk "{print \$3\"/\"\$2\" (\"\$5\")\"})"
-                    ' 2>/dev/null || echo "   Failed to get system info"
-                    
-                    # Check cloud-init status
-                    echo "☁️  Cloud-init Status:"
-                    ssh -i "${vm_dir}/ssh_key" -o ConnectTimeout=5 -o StrictHostKeyChecking=no runner@"$ip" '
-                        if systemctl is-active --quiet cloud-final; then
-                            echo "   ✅ cloud-final.service: $(systemctl show -p ActiveState --value cloud-final)"
-                        else
-                            echo "   ❌ cloud-final.service: $(systemctl show -p ActiveState --value cloud-final)"
-                            echo "   Last errors:"
-                            journalctl -u cloud-final --lines=3 --no-pager 2>/dev/null | sed "s/^/      /" || echo "      (no logs available)"
-                        fi
-                        
-                        if systemctl is-active --quiet cloud-init; then
-                            echo "   ✅ cloud-init.service: $(systemctl show -p ActiveState --value cloud-init)"
-                        else
-                            echo "   ❌ cloud-init.service: $(systemctl show -p ActiveState --value cloud-init)"
-                        fi
-                    ' 2>/dev/null || echo "   Failed to get cloud-init status"
-                    
-                    # Check GitHub runner status
-                    echo "🏃 GitHub Runner Status:"
-                    ssh -i "${vm_dir}/ssh_key" -o ConnectTimeout=5 -o StrictHostKeyChecking=no runner@"$ip" '
-                        if systemctl is-active --quiet github-runner; then
-                            echo "   ✅ github-runner.service: Running"
-                            if pgrep -f "actions.runner" >/dev/null; then
-                                echo "   ✅ Runner process: Active"
-                                echo "   📝 Runner logs (last 3 lines):"
-                                journalctl -u github-runner --lines=3 --no-pager 2>/dev/null | sed "s/^/      /" || echo "      (no logs available)"
-                            else
-                                echo "   ⚠️  Runner process: Not found"
-                            fi
-                        else
-                            echo "   ❌ github-runner.service: $(systemctl show -p ActiveState --value github-runner 2>/dev/null || echo "not found")"
-                        fi
-                        
-                        # Check if runner is configured
-                        if [ -f "/opt/runner/.runner" ]; then
-                            echo "   ✅ Runner configuration: Found"
-                            cat /opt/runner/.runner | jq -r "\"   🏷️  Runner name: \" + .agentName" 2>/dev/null || echo "   🏷️  Runner name: (failed to parse)"
-                        else
-                            echo "   ❌ Runner configuration: Missing"
-                        fi
-                        
-                        # Check environment variables
-                        if [ -f "/etc/environment" ]; then
-                            if grep -q "GITHUB_" /etc/environment; then
-                                echo "   ✅ Environment variables: Set"
-                            else
-                                echo "   ❌ Environment variables: Missing GITHUB_* vars"
-                            fi
-                        else
-                            echo "   ❌ Environment variables: /etc/environment missing"
-                        fi
-                    ' 2>/dev/null || echo "   Failed to get runner status"
-                    
-                    # Check Docker status
-                    echo "🐳 Docker Status:"
-                    ssh -i "${vm_dir}/ssh_key" -o ConnectTimeout=5 -o StrictHostKeyChecking=no runner@"$ip" '
-                        if systemctl is-active --quiet docker; then
-                            echo "   ✅ Docker service: Running"
-                            if docker info >/dev/null 2>&1; then
-                                echo "   ✅ Docker daemon: Accessible"
-                            else
-                                echo "   ❌ Docker daemon: Not accessible"
-                            fi
-                        else
-                            echo "   ❌ Docker service: $(systemctl show -p ActiveState --value docker 2>/dev/null || echo "not found")"
-                        fi
-                    ' 2>/dev/null || echo "   Failed to get Docker status"
-                    
-                else
-                    echo "❌ SSH: Not accessible"
-                fi
+            echo "VM: $vm_id"
+            
+            if [ -f "$info_file" ]; then
+                echo "  Info: $(cat "$info_file" | jq -c .)"
             fi
+            
+            if [ -S "$socket_path" ]; then
+                echo "  Socket: Active"
+                # Test API responsiveness
+                if curl --unix-socket "$socket_path" -s -X GET "http://localhost/" >/dev/null 2>&1; then
+                    echo "  API: Responsive"
+                else
+                    echo "  API: Not responding"
+                fi
+            else
+                echo "  Socket: Not found"
+            fi
+            
+            echo ""
         fi
     done
 }
 
-# Check runner status
+# Check GitHub runner status
 check_runner() {
     local vm_pattern="${1:-.*}"
     
-    if [ ! -d "instances" ]; then
-        print_info "No instances found"
-        return
-    fi
-    
     print_header "GitHub Runner Status"
     
-    for inst in instances/*/info.json; do
-        if [ -f "$inst" ]; then
-            local name=$(jq -r '.name' "$inst")
-            local ip=$(jq -r '.ip' "$inst")
-            local vm_dir=$(dirname "$inst")
+    if [ ! -d "instances" ]; then
+        print_info "No instances directory found"
+        return 0
+    fi
+    
+    for instance_dir in instances/*/; do
+        if [ -d "$instance_dir" ]; then
+            local vm_id=$(basename "$instance_dir")
             
-            if [[ "$name" =~ $vm_pattern ]]; then
-                echo -e "${BLUE}$name ($ip):${NC}"
+            if [[ "$vm_id" =~ $vm_pattern ]]; then
+                local info_file="${instance_dir}/info.json"
+                local ssh_key="${instance_dir}/ssh_key"
                 
-                if ssh -i "${vm_dir}/ssh_key" -o ConnectTimeout=3 -o StrictHostKeyChecking=no runner@"$ip" '
-                    if systemctl is-active --quiet github-runner && pgrep -f "actions.runner" >/dev/null; then
-                        echo "✅ Runner is running"
-                        if [ -f "/opt/runner/.runner" ]; then
-                            cat /opt/runner/.runner | jq -r "\"   Name: \" + .agentName + \", Pool: \" + .poolName" 2>/dev/null || echo "   (config available but failed to parse)"
+                if [ -f "$info_file" ] && [ -f "$ssh_key" ]; then
+                    local ip=$(jq -r '.ip // ""' "$info_file" 2>/dev/null)
+                    
+                    if [ -n "$ip" ] && [ "$ip" != "dhcp" ]; then
+                        echo "VM: $vm_id ($ip)"
+                        
+                        # Check if VM is accessible
+                        if ssh -i "$ssh_key" -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+                           runner@"$ip" 'echo "SSH OK"' >/dev/null 2>&1; then
+                            
+                            # Check runner service
+                            local runner_status=$(ssh -i "$ssh_key" -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+                                                 runner@"$ip" 'systemctl is-active github-runner 2>/dev/null || echo "inactive"')
+                            echo "  Runner Service: $runner_status"
+                            
+                            # Check runner process
+                            if ssh -i "$ssh_key" -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+                               runner@"$ip" 'pgrep -f "Runner\.Worker" >/dev/null 2>&1'; then
+                                echo "  Runner Process: Running (active job)"
+                            elif ssh -i "$ssh_key" -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+                                 runner@"$ip" 'pgrep -f "Runner\.Listener" >/dev/null 2>&1'; then
+                                echo "  Runner Process: Listening (idle)"
+                            else
+                                echo "  Runner Process: Not running"
+                            fi
+                            
+                        else
+                            echo "  SSH: Not accessible"
                         fi
-                    else
-                        echo "❌ Runner is not running"
-                        if systemctl --quiet is-failed github-runner; then
-                            echo "   Service failed. Last error:"
-                            journalctl -u github-runner --lines=2 --no-pager 2>/dev/null | tail -1 | sed "s/^/   /" || echo "   (no error logs)"
-                        fi
+                        
+                        echo ""
                     fi
-                ' 2>/dev/null; then
-                    : # SSH command succeeded
-                else
-                    echo "❌ Cannot connect to VM"
                 fi
-                echo
             fi
         fi
     done
 }
 
-# Monitor and destroy ephemeral VMs when jobs complete
+# Monitor ephemeral VMs and cleanup when jobs complete
 monitor_ephemeral() {
     print_header "Monitoring Ephemeral VMs"
     
-    print_info "Starting ephemeral VM monitoring..."
+    if [ ! -d "instances" ]; then
+        print_info "No instances directory found"
+        return 0
+    fi
+    
+    print_info "Monitoring for job completion and auto-cleanup..."
     
     while true; do
-        # Check all running VMs
-        for inst in instances/*/info.json; do
-            if [ -f "$inst" ]; then
-                local instance_dir=$(dirname "$inst")
-                local vm_name=$(jq -r '.name' "$inst" 2>/dev/null)
-                local pid=$(jq -r '.pid' "$inst" 2>/dev/null)
-                local ip=$(jq -r '.ip' "$inst" 2>/dev/null)
-                local ephemeral=$(jq -r '.ephemeral_mode' "$inst" 2>/dev/null)
+        for instance_dir in instances/*/; do
+            if [ -d "$instance_dir" ]; then
+                local vm_id=$(basename "$instance_dir")
+                local info_file="${instance_dir}/info.json"
                 
-                # Skip non-ephemeral VMs
-                if [ "$ephemeral" != "true" ]; then
-                    continue
-                fi
-                
-                print_info "Checking ephemeral VM: $vm_name"
-                
-                # Check if VM process is still alive
-                if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
-                    print_info "Ephemeral VM $vm_name has shutdown - cleaning up"
-                    rm -rf "$instance_dir"
-                    continue
-                fi
-                
-                # Check for completion signal via SSH
-                if [ "$ip" != "null" ] && [ -n "$ip" ]; then
-                    if ssh -i "$instance_dir/ssh_key" -o ConnectTimeout=3 -o StrictHostKeyChecking=no runner@"$ip" \
-                        '[ -f /tmp/ephemeral-cleanup ]' 2>/dev/null; then
-                        print_info "Job completion signal found for VM: $vm_name"
+                if [ -f "$info_file" ]; then
+                    local ephemeral=$(jq -r '.ephemeral_mode // false' "$info_file" 2>/dev/null)
+                    
+                    if [ "$ephemeral" = "true" ]; then
+                        local ssh_key="${instance_dir}/ssh_key"
+                        local ip=$(jq -r '.ip // ""' "$info_file" 2>/dev/null)
                         
-                        # Stop the VM
-                        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-                            print_info "Stopping VM process (PID: $pid)"
-                            kill "$pid" 2>/dev/null || true
-                            sleep 3
-                            kill -9 "$pid" 2>/dev/null || true
+                        if [ -f "$ssh_key" ] && [ -n "$ip" ] && [ "$ip" != "dhcp" ]; then
+                            # Check for completion signal
+                            if ssh -i "$ssh_key" -o ConnectTimeout=3 -o StrictHostKeyChecking=no \
+                               runner@"$ip" 'test -f /tmp/ephemeral-cleanup' >/dev/null 2>&1; then
+                                
+                                print_info "Job completed on ephemeral VM $vm_id - cleaning up"
+                                
+                                # Stop the VM
+                                local socket_path="${instance_dir}/firecracker.socket"
+                                if [ -S "$socket_path" ]; then
+                                    curl --unix-socket "$socket_path" \
+                                         -X PUT "http://localhost/actions" \
+                                         -H "Content-Type: application/json" \
+                                         -d '{"action_type": "SendCtrlAltDel"}' >/dev/null 2>&1
+                                fi
+                                
+                                sleep 5
+                                
+                                # Force cleanup
+                                local pid_file="${instance_dir}/firecracker.pid"
+                                if [ -f "$pid_file" ]; then
+                                    local pid=$(cat "$pid_file")
+                                    if ps -p "$pid" >/dev/null 2>&1; then
+                                        kill -9 "$pid" 2>/dev/null
+                                    fi
+                                fi
+                                
+                                # Remove instance
+                                rm -rf "$instance_dir"
+                                print_info "✅ Ephemeral VM $vm_id cleaned up"
+                            fi
                         fi
-                        
-                        # Clean up instance
-                        rm -rf "$instance_dir"
-                        print_info "✅ Ephemeral VM $vm_name destroyed and cleaned up"
                     fi
                 fi
             fi
         done
         
-        sleep 15
+        sleep 10
     done
 }
 
-# Cleanup everything  
+# Cleanup all VMs and resources
 cleanup() {
-    print_header "Cleaning Up"
+    print_header "Cleaning Up All Resources"
     
+    # Stop all VMs
     stop_vms
     
-    # Cleanup networking
+    # Clean up networking
     print_info "Cleaning up networking..."
     
-    # Clean up per-VM TAP devices (host bridge approach)
+    # Remove bridge if it exists and no VMs are using it
+    if ip link show "fc-br0" >/dev/null 2>&1; then
+        # Check if any TAP devices are still attached
+        local attached_taps=$(ip link show master fc-br0 2>/dev/null | grep -c "fc-tap" || echo "0")
+        if [ "$attached_taps" -eq 0 ]; then
+            sudo ip link del "fc-br0" 2>/dev/null || true
+            print_info "Removed bridge fc-br0"
+        else
+            print_warning "Bridge fc-br0 still has attached devices"
+        fi
+    fi
+    
+    # Remove any orphaned TAP devices
+    for tap in $(ip link show | grep "fc-tap" | cut -d: -f2 | cut -d@ -f1 | tr -d ' '); do
+        sudo ip link del "$tap" 2>/dev/null && print_info "Removed TAP device $tap"
+    done
+    
+    # Clean up instance directories for stopped VMs
     if [ -d "instances" ]; then
-        for inst in instances/*/info.json; do
-            if [ -f "$inst" ]; then
-                local tap=$(jq -r '.tap // ""' "$inst")
-                local networking=$(jq -r '.networking // "static"' "$inst")
-                if [ -n "$tap" ] && [ "$networking" = "dhcp" ]; then
-                    print_info "Removing TAP device: $tap"
-                    sudo ip link del "$tap" 2>/dev/null || true
+        for instance_dir in instances/*/; do
+            if [ -d "$instance_dir" ]; then
+                local vm_id=$(basename "$instance_dir")
+                local socket_path="${instance_dir}/firecracker.socket"
+                local pid_file="${instance_dir}/firecracker.pid"
+                
+                local running=false
+                if [ -f "$pid_file" ]; then
+                    local pid=$(cat "$pid_file")
+                    if ps -p "$pid" >/dev/null 2>&1; then
+                        running=true
+                    fi
+                fi
+                
+                if [ "$running" = false ] && [ ! -S "$socket_path" ]; then
+                    rm -rf "$instance_dir"
+                    print_info "Cleaned up stopped VM directory: $vm_id"
                 fi
             fi
         done
     fi
     
-    # Clean up default static networking devices
-    sudo ip link del "fc-tap0" 2>/dev/null || true
-    sudo ip link del "fc-br0" 2>/dev/null || true
-    sudo iptables -t nat -D POSTROUTING -s 172.16.0.0/24 -j MASQUERADE 2>/dev/null || true
+    print_info "✅ Cleanup complete"
+}
+
+# Create ARC runner VM
+create_runner_vm() {
+    local vm_id=""
+    local registration_token=""
+    local repository=""
+    local labels="self-hosted,firecracker"
+    local arc_webhook_url=""
+    local vcpu_count=2
+    local memory=2048
+    local ephemeral_mode=false
     
-    # Remove instances
-    if [ -d "instances" ]; then
-        rm -rf instances/*
-        print_info "Cleaned up instance data"
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --vm-id) vm_id="$2"; shift 2 ;;
+            --registration-token) registration_token="$2"; shift 2 ;;
+            --repository) repository="$2"; shift 2 ;;
+            --labels) labels="$2"; shift 2 ;;
+            --arc-webhook-url) arc_webhook_url="$2"; shift 2 ;;
+            --vcpu-count) vcpu_count="$2"; shift 2 ;;
+            --memory) memory="$2"; shift 2 ;;
+            --ephemeral) ephemeral_mode=true; shift ;;
+            *) print_error "Unknown create-runner-vm option: $1"; exit 1 ;;
+        esac
+    done
+    
+    # Validate required parameters
+    if [[ -z "$vm_id" ]] || [[ -z "$registration_token" ]] || [[ -z "$repository" ]]; then
+        print_error "Required parameters missing for create-runner-vm"
+        print_info "Usage: $0 create-runner-vm --vm-id <id> --registration-token <token> --repository <repo>"
+        exit 1
     fi
     
-    print_info "✅ Cleanup complete"
-    print_info "Note: Host bridge 'br0' (if used) is left intact"
+    print_header "Creating ARC Runner VM: $vm_id"
+    
+    # Check if VM already exists
+    local instance_dir="instances/${vm_id}"
+    if [[ -d "$instance_dir" ]]; then
+        print_error "VM with ID $vm_id already exists"
+        exit 1
+    fi
+    
+    # Create GitHub URL from repository
+    local github_url="https://github.com/${repository}"
+    
+    # Launch VM with ARC mode
+    launch_vm \
+        --name "$vm_id" \
+        --github-url "$github_url" \
+        --github-token "$registration_token" \
+        --labels "$labels" \
+        --memory "$memory" \
+        --cpus "$vcpu_count" \
+        --arc-mode \
+        --arc-controller-url "$arc_webhook_url" \
+        $([ "$ephemeral_mode" = true ] && echo "--ephemeral-mode")
+    
+    print_info "✅ ARC Runner VM $vm_id created successfully"
 }
 
 # Usage
@@ -1901,6 +2518,13 @@ usage() {
     echo "  monitor-ephemeral         Monitor and cleanup ephemeral VMs"
     echo "  cleanup                   Stop all VMs and cleanup"
     echo ""
+    echo "ARC Integration Commands:"
+    echo "  create-runner-vm          Create VM for ARC controller"
+    echo "  list-arc-vms              List ARC-managed VMs"
+    echo "  delete-arc-vm <vm-id>     Delete specific ARC VM"
+    echo "  get-arc-vm-status <vm-id> Get ARC VM status"
+    echo "  cleanup-arc-vms           Cleanup stopped ARC VMs"
+    echo ""
     echo "Build Options:"
     echo "  --config <path>           Custom kernel config file"
     echo "  --rebuild-kernel          Force rebuild kernel"
@@ -1908,8 +2532,8 @@ usage() {
     echo "  --skip-deps               Skip dependency checks"
     echo ""
     echo "Launch Options:"
-    echo "  --snapshot <name>         Use specific snapshot"
-    echo "  --name <name>             VM name"
+    echo "  --snapshot <n>         Use specific snapshot"
+    echo "  --name <n>             VM name"
     echo "  --github-url <url>        GitHub repo/org/enterprise URL"
     echo "  --github-pat <pat>        GitHub PAT (generates registration token)"
     echo "  --labels <labels>         Runner labels (default: firecracker)"
@@ -1922,6 +2546,16 @@ usage() {
     echo "  --arc-mode                Enable ARC integration"
     echo "  --ephemeral-mode          Auto-shutdown after job completion"
     echo ""
+    echo "ARC Integration Options:"
+    echo "  --vm-id <id>              Unique VM identifier"
+    echo "  --registration-token <token> GitHub registration token"
+    echo "  --repository <repo>       GitHub repository (owner/name)"
+    echo "  --labels <labels>         Comma-separated runner labels"
+    echo "  --arc-webhook-url <url>   ARC webhook endpoint URL"
+    echo "  --vcpu-count <n>          Number of vCPUs"
+    echo "  --memory <mb>             Memory in MB"
+    echo "  --ephemeral               Enable ephemeral mode"
+    echo ""
     echo "Examples:"
     echo "  # Build components"
     echo "  $0 build-kernel --rebuild-kernel"
@@ -1933,11 +2567,21 @@ usage() {
     echo "  $0 launch --ephemeral-mode --github-url https://github.com/org/repo --github-pat ghp_xxxx"
     echo "  $0 launch --docker-mode --github-url https://github.com/org/repo --github-pat ghp_xxxx"
     echo ""
+    echo "  # ARC Integration"
+    echo "  $0 create-runner-vm \\"
+    echo "      --vm-id runner-001 \\"
+    echo "      --registration-token AXXXX \\"
+    echo "      --repository myorg/myrepo \\"
+    echo "      --labels \"self-hosted,firecracker\" \\"
+    echo "      --arc-webhook-url http://arc-controller:8080"
+    echo ""
     echo "  # Management"
     echo "  $0 list                   # Show all resources"
+    echo "  $0 list-arc-vms           # Show ARC VMs only"
     echo "  $0 status                 # Check VM health"
     echo "  $0 monitor-ephemeral      # Monitor job completion"
     echo "  $0 cleanup                # Stop everything"
+    echo "  $0 cleanup-arc-vms        # Cleanup ARC VMs only"
     echo ""
     echo "Security: PAT tokens stay on host, only short-lived registration tokens"
     echo "          are passed to VMs (following GitHub ARC security model)"
@@ -1956,7 +2600,7 @@ main() {
     shift || true
     
     # Show banner for main commands (not for help/version)
-    if [[ "$cmd" =~ ^(build-kernel|build-fs|snapshot|launch|list|cleanup)$ ]]; then
+    if [[ "$cmd" =~ ^(build-kernel|build-fs|snapshot|launch|list|cleanup|create-runner-vm|list-arc-vms)$ ]]; then
         print_banner
     fi
     
@@ -2020,6 +2664,35 @@ main() {
             setup_workspace
             cleanup
             ;;
+        
+        # ARC Integration Commands
+        create-runner-vm)
+            check_os
+            if [ "$skip_deps_global" = false ]; then
+                check_dependencies
+            else
+                print_warning "Skipping dependency checks (--skip-deps specified)"
+            fi
+            setup_workspace
+            create_runner_vm "$@"
+            ;;
+        list-arc-vms)
+            setup_workspace
+            list_arc_vms
+            ;;
+        delete-arc-vm)
+            setup_workspace
+            delete_arc_vm "$@"
+            ;;
+        get-arc-vm-status)
+            setup_workspace
+            get_arc_vm_status "$@"
+            ;;
+        cleanup-arc-vms)
+            setup_workspace
+            cleanup_arc_vms
+            ;;
+        
         version|--version|-v)
             echo "Firecracker Complete v${VERSION}"
             echo "GitHub Actions Runner on Firecracker VMs"
@@ -2029,6 +2702,7 @@ main() {
             echo "  • Complete filesystem with Docker CE + GitHub Actions runner"
             echo "  • Cloud-init networking with shared bridge architecture"
             echo "  • VM management and monitoring"
+            echo "  • ARC (Actions Runner Controller) integration"
             echo ""
             echo "Requirements: Ubuntu 24.04+ with KVM support"
             ;;

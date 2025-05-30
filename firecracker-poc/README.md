@@ -248,6 +248,178 @@ ssh -i firecracker-data/instances/vm-*/ssh_key runner@<vm-ip> 'env | grep -i git
 # Should only show RUNNER_TOKEN, never GITHUB_TOKEN or PAT
 ```
 
+## ARC (Actions Runner Controller) Integration
+
+**NEW**: Firecracker Complete now supports integration with GitHub's Actions Runner Controller (ARC) for Kubernetes environments. This allows ARC to create and manage Firecracker VMs instead of Kubernetes pods.
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Kubernetes Cluster                                          │
+│                                                             │
+│ ┌─────────────────┐     ┌─────────────────┐                │
+│ │ ARC Controller  │────▶│ Firecracker VMs │                │
+│ │                 │     │                 │                │
+│ │ - Pod Management│     │ - VM Management │                │
+│ │ - Webhook Server│     │ - Registration  │                │
+│ └─────────────────┘     └─────────────────┘                │
+│          │                       │                          │
+│          │                       │                          │
+└──────────┼───────────────────────┼──────────────────────────┘
+           │                       │
+           │                       │
+    ┌──────▼───────┐         ┌─────▼─────┐
+    │ GitHub       │         │ VM Host   │
+    │ Actions      │         │           │
+    │              │         │ firecracker-poc/
+    │              │         │ ├── VMs   │
+    │              │         │ └── Scripts
+    └──────────────┘         └───────────┘
+```
+
+### ARC Integration Commands
+
+```bash
+# Create VM for ARC controller
+./firecracker-complete.sh create-runner-vm \
+    --vm-id runner-001 \
+    --registration-token AXXXX \
+    --repository myorg/myrepo \
+    --labels "self-hosted,firecracker" \
+    --arc-webhook-url http://arc-controller:8080 \
+    --vcpu-count 4 \
+    --memory 4096 \
+    --ephemeral true
+
+# List ARC-managed VMs
+./firecracker-complete.sh list-arc-vms
+
+# Get specific VM status
+./firecracker-complete.sh get-arc-vm-status runner-001
+
+# Delete specific ARC VM
+./firecracker-complete.sh delete-arc-vm runner-001
+
+# Cleanup stopped ARC VMs
+./firecracker-complete.sh cleanup-arc-vms
+```
+
+### ARC Integration Options
+
+| Option | Description | Example |
+|--------|-------------|---------|
+| `--vm-id` | Unique VM identifier | `runner-001` |
+| `--registration-token` | GitHub registration token | `AXXXX...` |
+| `--repository` | GitHub repository | `myorg/myrepo` |
+| `--labels` | Comma-separated runner labels | `self-hosted,firecracker` |
+| `--arc-webhook-url` | ARC webhook endpoint URL | `http://arc-controller:8080` |
+| `--vcpu-count` | Number of vCPUs | `4` |
+| `--memory` | Memory in MB | `4096` |
+| `--ephemeral` | Enable ephemeral mode | `true` |
+
+### Security Model
+
+**Maintained ARC Security:**
+- PAT tokens stay on ARC controller (Kubernetes host)
+- Only short-lived registration tokens sent to VMs
+- VMs cannot access long-lived credentials
+- SSH keys for VM management stored in Kubernetes secrets
+
+**VM-to-ARC Communication:**
+- VMs authenticate to ARC webhook using shared secrets
+- IP-based allow listing for VM communication
+- TLS for all VM-to-ARC communication
+
+### VM Lifecycle
+
+1. **ARC Controller** calls `create-runner-vm` with registration token
+2. **VM** boots with cloud-init containing GitHub runner setup
+3. **VM** reports status to ARC webhook endpoints
+4. **VM** runs GitHub Actions jobs
+5. **VM** notifies ARC on job completion (ephemeral mode)
+6. **ARC** cleans up completed VMs
+
+### Testing ARC Integration
+
+Use the included test script to validate ARC integration:
+
+```bash
+# Run complete test suite
+./test-arc-integration.sh all
+
+# Test specific components
+./test-arc-integration.sh architecture
+./test-arc-integration.sh integration
+./test-arc-integration.sh communication
+
+# Start mock webhook server for testing
+./test-arc-integration.sh webhook
+```
+
+### Benefits of ARC + Firecracker
+
+**Performance:**
+- Faster startup than container pulls
+- Better isolation than containers
+- Direct hardware access for demanding workloads
+
+**Security:**
+- Complete kernel isolation
+- Controlled networking environment
+- No shared kernel vulnerabilities
+- Maintains ARC security model
+
+**Flexibility:**
+- Custom kernel configurations
+- Support for different Linux distributions
+- Direct hardware device access
+
+**Cost Optimization:**
+- More efficient resource utilization
+- Faster scale-down (immediate VM termination)
+- No container image storage overhead
+
+## Usage
+
+### ... existing usage section ...
+
+## Troubleshooting
+
+### ... existing troubleshooting section ...
+
+### ARC Integration Issues
+
+**VM not starting with ARC:**
+```bash
+# Check ARC integration syntax
+./firecracker-complete.sh create-runner-vm --help
+
+# Verify registration token
+curl -H "Authorization: token YOUR_PAT" \
+     https://api.github.com/repos/OWNER/REPO/actions/runners/registration-token
+```
+
+**VM not communicating with ARC:**
+```bash
+# Check webhook endpoints
+curl -X POST http://arc-controller:8080/vm/status \
+     -H "Content-Type: application/json" \
+     -d '{"vm_id":"test","status":"running"}'
+
+# Check VM networking
+./firecracker-complete.sh list-arc-vms
+```
+
+**Ephemeral VMs not cleaning up:**
+```bash
+# Check job completion monitoring
+./firecracker-complete.sh get-arc-vm-status VM_ID
+
+# Force cleanup
+./firecracker-complete.sh cleanup-arc-vms
+```
+
 ---
 
 **Production-ready GitHub Actions runners with enterprise security! 🚀🔒** 
