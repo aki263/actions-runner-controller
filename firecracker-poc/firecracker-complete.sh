@@ -614,8 +614,8 @@ launch_vm() {
     ssh-keygen -t rsa -b 4096 -f "ssh_key" -N "" -C "$runner_name" >/dev/null 2>&1
     
     # Setup shared bridge networking
-    local bridge="firecracker-br0"
-    local tap="firecracker-tap0"
+    local bridge="fc-br0"
+    local tap="fc-tap0"
     local gateway_ip="172.16.0.1"
     local ip_suffix=$((16#$(echo "$vm_id" | sha256sum | head -c 2) % 200 + 10))
     if [ $ip_suffix -eq 1 ]; then ip_suffix=10; fi
@@ -625,16 +625,36 @@ launch_vm() {
     
     # Create bridge if needed
     if ! ip link show "$bridge" >/dev/null 2>&1; then
-        sudo ip link add name "$bridge" type bridge
-        sudo ip addr add "${gateway_ip}/24" dev "$bridge"
-        sudo ip link set dev "$bridge" up
+        print_info "Creating bridge: $bridge"
+        sudo ip link add name "$bridge" type bridge 2>/dev/null || {
+            print_error "Failed to create bridge $bridge"
+            exit 1
+        }
+        sudo ip addr add "${gateway_ip}/24" dev "$bridge" 2>/dev/null || {
+            print_error "Failed to assign IP to bridge $bridge"
+            exit 1
+        }
+        sudo ip link set dev "$bridge" up 2>/dev/null || {
+            print_error "Failed to bring up bridge $bridge"
+            exit 1
+        }
     fi
     
     # Create shared TAP if needed
     if ! ip link show "$tap" >/dev/null 2>&1; then
-        sudo ip tuntap add dev "$tap" mode tap
-        sudo ip link set dev "$tap" master "$bridge"
-        sudo ip link set dev "$tap" up
+        print_info "Creating TAP device: $tap"
+        sudo ip tuntap add dev "$tap" mode tap 2>/dev/null || {
+            print_error "Failed to create TAP device $tap"
+            exit 1
+        }
+        sudo ip link set dev "$tap" master "$bridge" 2>/dev/null || {
+            print_error "Failed to attach TAP device to bridge"
+            exit 1
+        }
+        sudo ip link set dev "$tap" up 2>/dev/null || {
+            print_error "Failed to bring up TAP device $tap"
+            exit 1
+        }
     fi
     
     # Enable NAT
@@ -864,17 +884,17 @@ list_vms() {
     if [[ "$(uname -s)" == "Linux" ]] && command -v ip &> /dev/null; then
         echo
         echo -e "${GREEN}Network Status:${NC}"
-        if ip link show firecracker-br0 >/dev/null 2>&1; then
-            local bridge_ip=$(ip addr show firecracker-br0 | grep 'inet ' | awk '{print $2}' | head -1)
-            echo "  Bridge: firecracker-br0 ($bridge_ip) ✅"
+        if ip link show fc-br0 >/dev/null 2>&1; then
+            local bridge_ip=$(ip addr show fc-br0 | grep 'inet ' | awk '{print $2}' | head -1)
+            echo "  Bridge: fc-br0 ($bridge_ip) ✅"
         else
-            echo "  Bridge: firecracker-br0 (not configured)"
+            echo "  Bridge: fc-br0 (not configured)"
         fi
         
-        if ip link show firecracker-tap0 >/dev/null 2>&1; then
-            echo "  TAP: firecracker-tap0 ✅"
+        if ip link show fc-tap0 >/dev/null 2>&1; then
+            echo "  TAP: fc-tap0 ✅"
         else
-            echo "  TAP: firecracker-tap0 (not configured)"
+            echo "  TAP: fc-tap0 (not configured)"
         fi
     fi
 }
@@ -917,8 +937,8 @@ cleanup() {
     
     # Cleanup networking
     print_info "Cleaning up networking..."
-    sudo ip link del "firecracker-tap0" 2>/dev/null || true
-    sudo ip link del "firecracker-br0" 2>/dev/null || true
+    sudo ip link del "fc-tap0" 2>/dev/null || true
+    sudo ip link del "fc-br0" 2>/dev/null || true
     sudo iptables -t nat -D POSTROUTING -s 172.16.0.0/24 -j MASQUERADE 2>/dev/null || true
     
     # Remove instances
