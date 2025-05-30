@@ -1,0 +1,33 @@
+cat > cloud-init/user-data <<EOF
+#cloud-config
+hostname: ${runner_name}
+
+users:
+  - name: runner
+    ssh_authorized_keys:
+      - $(cat ssh_key.pub)
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+
+write_files:
+  - path: /etc/environment
+    content: |
+      GITHUB_TOKEN=${final_github_token}
+      GITHUB_URL=${github_url}
+      RUNNER_NAME=${runner_name}
+      RUNNER_LABELS=${labels}
+      RUNNER_TOKEN=${final_github_token}
+  - path: /usr/local/bin/setup-runner.sh
+    permissions: '0755'
+    content: |
+$(echo "$setup_script_content" | sed 's/^/      /')
+  - path: /etc/systemd/network/10-eth0.network
+    content: |${network_config}
+
+runcmd:
+  - systemctl enable systemd-networkd
+  - systemctl restart systemd-networkd
+$(if [ "$arc_mode" = true ]; then echo "  - nohup /usr/local/bin/setup-runner.sh > /var/log/arc-runner.log 2>&1 &"; elif [ "$docker_mode" = true ]; then echo "  - nohup /usr/local/bin/setup-runner.sh > /var/log/docker-runner.log 2>&1 &"; else echo "  - /usr/local/bin/setup-runner.sh"; fi)
+
+ssh_pwauth: false
+EOF 

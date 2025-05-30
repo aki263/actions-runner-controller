@@ -1207,492 +1207,127 @@ launch_vm() {
       DNS=8.8.4.4"
         fi
         
-        # Create setup script content based on mode
+        # Define setup script content based on mode
         local setup_script_content=""
         if [ "$arc_mode" = true ]; then
-            setup_script_content="#!/bin/bash
-      set -euo pipefail
-      
-      # Logging function
-      log() {
-          echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] \$1\" | tee -a /var/log/arc-runner.log
-      }
-      
-      # Setup Docker networking
-      setup_docker_networking() {
-          log \"Configuring Docker networking...\"
-          
-          # Enable IPv4 forwarding
-          echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.conf
-          echo 'net.bridge.bridge-nf-call-iptables = 1' >> /etc/sysctl.conf 2>/dev/null || true
-          echo 'net.bridge.bridge-nf-call-ip6tables = 1' >> /etc/sysctl.conf 2>/dev/null || true
-          sysctl -p
-          
-          # Load networking modules with graceful fallback
-          log \"Loading networking modules...\"
-          modprobe br_netfilter 2>/dev/null && log \"✅ br_netfilter loaded\" || log \"⚠️  br_netfilter not available\"
-          modprobe xt_conntrack 2>/dev/null && log \"✅ xt_conntrack loaded\" || log \"⚠️  xt_conntrack not available\" 
-          modprobe overlay 2>/dev/null && log \"✅ overlay loaded\" || log \"⚠️  overlay not available\"
-          modprobe bridge 2>/dev/null && log \"✅ bridge loaded\" || log \"⚠️  bridge not available\"
-          
-          # Setup fallback iptables rules if needed
-          if ! lsmod | grep -q br_netfilter; then
-              log \"Setting up fallback iptables rules for Docker\"
-              iptables -t nat -A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE 2>/dev/null || true
-              iptables -A FORWARD -o docker0 -j ACCEPT 2>/dev/null || true
-              iptables -A FORWARD -i docker0 ! -o docker0 -j ACCEPT 2>/dev/null || true
-          fi
-          
-          # Restart Docker and test
-          log \"Restarting Docker...\"
-          systemctl restart docker
-          sleep 10
-          
-          # Test Docker functionality
-          if timeout 30 docker run --rm alpine:latest echo \"Docker test\" >/dev/null 2>&1; then
-              log \"✅ Docker networking functional\"
-              return 0
-          else
-              log \"⚠️  Docker test failed - continuing anyway\"
-              return 1
-          fi
-      }
-      
-      # Setup GitHub runner
-      setup_github_runner() {
-          local runner_mode=\"\$1\"
-          
-          log \"Configuring GitHub Actions runner in \$runner_mode mode...\"
-          cd /opt/runner
-          
-          # Remove existing config
-          sudo -u runner ./config.sh remove --token \"\$RUNNER_TOKEN\" 2>/dev/null || true
-          
-          # Create work directory
-          mkdir -p /tmp/runner-work
-          chown runner:runner /tmp/runner-work
-          
-          # Configure runner
-          sudo -u runner ./config.sh \\
-              --url \"\$GITHUB_URL\" \\
-              --token \"\$RUNNER_TOKEN\" \\
-              --name \"\${RUNNER_NAME:-\$(hostname)}\" \\
-              --labels \"\${RUNNER_LABELS:-firecracker}\" \\
-              --work \"/tmp/runner-work\" \\
-              --unattended --replace || {
-              log \"ERROR: Runner configuration failed\"
-              return 1
-          }
-          
-          log \"✅ Runner configured successfully\"
-          return 0
-      }
-      
-      # Job completion handling for ephemeral VMs
-      handle_job_completion() {
-          log \"Setting up job completion monitoring...\"
-          
-          cat > /usr/local/bin/monitor-job-completion.sh << 'JOBEOF'
-#!/bin/bash
+            setup_script_content='#!/bin/bash
 set -euo pipefail
 
-# Logging function
 log() {
-    echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] \$1\" | tee -a /var/log/job-monitor.log
+    echo "[$(date +'\''%Y-%m-%d %H:%M:%S'\''] $1" | tee -a /var/log/arc-runner.log
 }
 
-LAST_JOB_CHECK=\$(date +%s)
-JOB_RUNNING=false
+log "=== ARC-Mode GitHub Actions Runner Setup ==="
 
-while true; do
-    # Check if runner worker is active
-    if pgrep -f \"Runner.Worker\" >/dev/null; then
-        if [ \"\$JOB_RUNNING\" = false ]; then
-            log \"Job started - worker process detected\"
-            JOB_RUNNING=true
-        fi
-        LAST_JOB_CHECK=\$(date +%s)
-    else
-        if [ \"\$JOB_RUNNING\" = true ]; then
-            log \"Job completed - worker process finished\"
-            JOB_RUNNING=false
-            
-            # Signal completion for ephemeral VMs
-            if [ \"\${EPHEMERAL_MODE:-false}\" = \"true\" ]; then
-                log \"Ephemeral mode: VM shutting down after job completion\"
-                
-                # Create completion signal
-                echo \"job_completed:\$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > /tmp/ephemeral-cleanup
-                
-                # Give time for logs to flush
-                sleep 5
-                
-                # Shutdown the VM
-                log \"Shutting down VM...\"
-                shutdown -h +1 \"Job completed - ephemeral shutdown\" &
-                exit 0
-            fi
-        fi
+if [ -f /etc/environment ]; then
+    set -a
+    source /etc/environment
+    set +a
+fi
+
+if [ -z "${RUNNER_TOKEN:-}" ] || [ -z "${GITHUB_URL:-}" ]; then
+    log "ERROR: Missing required environment variables"
+    exit 1
+fi
+
+for i in {1..30}; do
+    if curl -s --connect-timeout 3 https://api.github.com/zen >/dev/null; then
+        break
     fi
-    
-    # Check if runner service is still alive
-    if ! systemctl is-active --quiet github-runner; then
-        log \"Runner service stopped - restarting\"
-        systemctl restart github-runner
-        sleep 10
+    if [ $i -eq 30 ]; then
+        exit 1
     fi
-    
-    sleep 5
+    sleep 2
 done
-JOBEOF
-          
-          chmod +x /usr/local/bin/monitor-job-completion.sh
-          
-          # Create systemd service for job monitoring
-          cat > /etc/systemd/system/job-monitor.service << 'SVCEOF'
-[Unit]
-Description=GitHub Actions Job Completion Monitor
-After=github-runner.service
-Requires=github-runner.service
 
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/local/bin/monitor-job-completion.sh
-Restart=always
-RestartSec=10
-Environment=EPHEMERAL_MODE=\${EPHEMERAL_MODE:-false}
+systemctl start docker
+usermod -aG docker runner
 
-[Install]
-WantedBy=multi-user.target
-SVCEOF
-          
-          systemctl enable job-monitor
-          log \"✅ Job completion monitoring configured\"
-      }
-      
-      log \"=== ARC-Mode GitHub Actions Runner Setup ===\"
-      
-      # Wait for network
-      log \"Waiting for network connectivity...\"
-      for i in {1..30}; do
-          if curl -s --connect-timeout 3 https://api.github.com/zen >/dev/null; then
-              log \"Network connectivity confirmed\"
-              break
-          fi
-          [ \$i -eq 30 ] && { log \"Network timeout\"; exit 1; }
-          sleep 2
-      done
-      
-      # Start Docker
-      systemctl start docker
-      usermod -aG docker runner
-      
-      # Setup Docker networking
-      setup_docker_networking
-      
-      # Setup runner
-      setup_github_runner \"arc\"
-      
-      # Setup job monitoring for ephemeral mode
-      export EPHEMERAL_MODE=\"${ephemeral_mode}\"
-      handle_job_completion
-      
-      # Start services
-      systemctl start github-runner
-      systemctl start job-monitor
-      
-      log \"=== ARC Setup Complete ===\""
+cd /opt/runner
+sudo -u runner ./config.sh --url "$GITHUB_URL" --token "$RUNNER_TOKEN" --name "$(hostname)" --labels "firecracker" --unattended --replace
+systemctl start github-runner
+
+log "=== ARC Setup Complete ==="'
         elif [ "$docker_mode" = true ]; then
-            setup_script_content="#!/bin/bash
-      set -euo pipefail
-      
-      # Logging function
-      log() {
-          echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] \$1\" | tee -a /var/log/docker-runner.log
-      }
-      
-      # Setup Docker networking
-      setup_docker_networking() {
-          log \"Configuring Docker networking...\"
-          
-          # Enable IPv4 forwarding
-          echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.conf
-          echo 'net.bridge.bridge-nf-call-iptables = 1' >> /etc/sysctl.conf 2>/dev/null || true
-          echo 'net.bridge.bridge-nf-call-ip6tables = 1' >> /etc/sysctl.conf 2>/dev/null || true
-          sysctl -p
-          
-          # Load networking modules with graceful fallback
-          log \"Loading networking modules...\"
-          modprobe br_netfilter 2>/dev/null && log \"✅ br_netfilter loaded\" || log \"⚠️  br_netfilter not available\"
-          modprobe xt_conntrack 2>/dev/null && log \"✅ xt_conntrack loaded\" || log \"⚠️  xt_conntrack not available\" 
-          modprobe overlay 2>/dev/null && log \"✅ overlay loaded\" || log \"⚠️  overlay not available\"
-          modprobe bridge 2>/dev/null && log \"✅ bridge loaded\" || log \"⚠️  bridge not available\"
-          
-          # Setup fallback iptables rules if needed
-          if ! lsmod | grep -q br_netfilter; then
-              log \"Setting up fallback iptables rules for Docker\"
-              iptables -t nat -A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE 2>/dev/null || true
-              iptables -A FORWARD -o docker0 -j ACCEPT 2>/dev/null || true
-              iptables -A FORWARD -i docker0 ! -o docker0 -j ACCEPT 2>/dev/null || true
-          fi
-          
-          # Restart Docker and test
-          log \"Restarting Docker...\"
-          systemctl restart docker
-          sleep 10
-          
-          # Test Docker functionality
-          if timeout 30 docker run --rm alpine:latest echo \"Docker test\" >/dev/null 2>&1; then
-              log \"✅ Docker networking functional\"
-              return 0
-          else
-              log \"⚠️  Docker test failed - continuing anyway\"
-              return 1
-          fi
-      }
-      
-      # Setup GitHub runner
-      setup_github_runner() {
-          local runner_mode=\"\$1\"
-          
-          log \"Configuring GitHub Actions runner in \$runner_mode mode...\"
-          cd /opt/runner
-          
-          # Remove existing config
-          sudo -u runner ./config.sh remove --token \"\$RUNNER_TOKEN\" 2>/dev/null || true
-          
-          # Create work directory
-          mkdir -p /tmp/runner-work
-          chown runner:runner /tmp/runner-work
-          
-          # Configure runner
-          sudo -u runner ./config.sh \\
-              --url \"\$GITHUB_URL\" \\
-              --token \"\$RUNNER_TOKEN\" \\
-              --name \"\${RUNNER_NAME:-\$(hostname)}\" \\
-              --labels \"\${RUNNER_LABELS:-firecracker}\" \\
-              --work \"/tmp/runner-work\" \\
-              --unattended --replace || {
-              log \"ERROR: Runner configuration failed\"
-              return 1
-          }
-          
-          log \"✅ Runner configured successfully\"
-          return 0
-      }
-      
-      # Job completion handling for ephemeral VMs
-      handle_job_completion() {
-          log \"Setting up job completion monitoring...\"
-          
-          cat > /usr/local/bin/monitor-job-completion.sh << 'JOBEOF'
-#!/bin/bash
+            setup_script_content='#!/bin/bash
 set -euo pipefail
 
-# Logging function
 log() {
-    echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] \$1\" | tee -a /var/log/job-monitor.log
+    echo "[$(date +'\''%Y-%m-%d %H:%M:%S'\''] $1" | tee -a /var/log/docker-runner.log
 }
 
-LAST_JOB_CHECK=\$(date +%s)
-JOB_RUNNING=false
+log "=== Docker-Mode GitHub Actions Runner Setup ==="
 
-while true; do
-    # Check if runner worker is active
-    if pgrep -f \"Runner.Worker\" >/dev/null; then
-        if [ \"\$JOB_RUNNING\" = false ]; then
-            log \"Job started - worker process detected\"
-            JOB_RUNNING=true
-        fi
-        LAST_JOB_CHECK=\$(date +%s)
-    else
-        if [ \"\$JOB_RUNNING\" = true ]; then
-            log \"Job completed - worker process finished\"
-            JOB_RUNNING=false
-            
-            # Signal completion for ephemeral VMs
-            if [ \"\${EPHEMERAL_MODE:-false}\" = \"true\" ]; then
-                log \"Ephemeral mode: VM shutting down after job completion\"
-                
-                # Create completion signal
-                echo \"job_completed:\$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > /tmp/ephemeral-cleanup
-                
-                # Give time for logs to flush
-                sleep 5
-                
-                # Shutdown the VM
-                log \"Shutting down VM...\"
-                shutdown -h +1 \"Job completed - ephemeral shutdown\" &
-                exit 0
-            fi
-        fi
+if [ -f /etc/environment ]; then
+    set -a
+    source /etc/environment
+    set +a
+fi
+
+if [ -z "${RUNNER_TOKEN:-}" ] || [ -z "${GITHUB_URL:-}" ]; then
+    log "ERROR: Missing required environment variables"
+    exit 1
+fi
+
+for i in {1..30}; do
+    if curl -s --connect-timeout 3 https://api.github.com/zen >/dev/null; then
+        break
     fi
-    
-    # Check if runner service is still alive
-    if ! systemctl is-active --quiet github-runner; then
-        log \"Runner service stopped - restarting\"
-        systemctl restart github-runner
-        sleep 10
+    if [ $i -eq 30 ]; then
+        exit 1
     fi
-    
-    sleep 5
+    sleep 2
 done
-JOBEOF
-          
-          chmod +x /usr/local/bin/monitor-job-completion.sh
-          
-          # Create systemd service for job monitoring
-          cat > /etc/systemd/system/job-monitor.service << 'SVCEOF'
-[Unit]
-Description=GitHub Actions Job Completion Monitor
-After=github-runner.service
-Requires=github-runner.service
 
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/local/bin/monitor-job-completion.sh
-Restart=always
-RestartSec=10
-Environment=EPHEMERAL_MODE=\${EPHEMERAL_MODE:-false}
+systemctl start docker
+usermod -aG docker runner
 
-[Install]
-WantedBy=multi-user.target
-SVCEOF
-          
-          systemctl enable job-monitor
-          log \"✅ Job completion monitoring configured\"
-      }
-      
-      log \"=== Docker-Mode GitHub Actions Runner Setup ===\"
-      
-      # Wait for network
-      for i in {1..30}; do
-          if curl -s --connect-timeout 3 https://api.github.com/zen >/dev/null; then
-              log \"Network ready\"
-              break
-          fi
-          [ \$i -eq 30 ] && exit 1
-          sleep 2
-      done
-      
-      # Start Docker and setup networking
-      systemctl start docker
-      usermod -aG docker runner
-      setup_docker_networking
-      
-      # Setup runner
-      setup_github_runner \"docker\"
-      
-      # Run in foreground like Docker containers do
-      log \"Starting runner in foreground (Docker mode)...\"
-      cd /opt/runner
-      exec sudo -u runner ./run.sh"
+cd /opt/runner
+sudo -u runner ./config.sh --url "$GITHUB_URL" --token "$RUNNER_TOKEN" --name "$(hostname)" --labels "firecracker" --unattended --replace
+exec sudo -u runner ./run.sh'
         else
-            setup_script_content="#!/bin/bash
-      set -euo pipefail
+            setup_script_content='#!/bin/bash
+set -euo pipefail
 
-      # Logging function
-      log() {
-          echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] \$1\" | tee -a /var/log/setup-runner.log
-      }
-      
-      # Setup Docker networking
-      setup_docker_networking() {
-          log \"Configuring Docker networking...\"
-          
-          # Enable IPv4 forwarding
-          echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.conf
-          echo 'net.bridge.bridge-nf-call-iptables = 1' >> /etc/sysctl.conf 2>/dev/null || true
-          echo 'net.bridge.bridge-nf-call-ip6tables = 1' >> /etc/sysctl.conf 2>/dev/null || true
-          sysctl -p
-          
-          # Load networking modules with graceful fallback
-          log \"Loading networking modules...\"
-          modprobe br_netfilter 2>/dev/null && log \"✅ br_netfilter loaded\" || log \"⚠️  br_netfilter not available\"
-          modprobe xt_conntrack 2>/dev/null && log \"✅ xt_conntrack loaded\" || log \"⚠️  xt_conntrack not available\" 
-          modprobe overlay 2>/dev/null && log \"✅ overlay loaded\" || log \"⚠️  overlay not available\"
-          modprobe bridge 2>/dev/null && log \"✅ bridge loaded\" || log \"⚠️  bridge not available\"
-          
-          # Setup fallback iptables rules if needed
-          if ! lsmod | grep -q br_netfilter; then
-              log \"Setting up fallback iptables rules for Docker\"
-              iptables -t nat -A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE 2>/dev/null || true
-              iptables -A FORWARD -o docker0 -j ACCEPT 2>/dev/null || true
-              iptables -A FORWARD -i docker0 ! -o docker0 -j ACCEPT 2>/dev/null || true
-          fi
-          
-          # Restart Docker and test
-          log \"Restarting Docker...\"
-          systemctl restart docker
-          sleep 10
-          
-          # Test Docker functionality
-          if timeout 30 docker run --rm alpine:latest echo \"Docker test\" >/dev/null 2>&1; then
-              log \"✅ Docker networking functional\"
-              return 0
-          else
-              log \"⚠️  Docker test failed - continuing anyway\"
-              return 1
-          fi
-      }
-      
-      # Setup GitHub runner
-      setup_github_runner() {
-          local runner_mode=\"\$1\"
-          
-          log \"Configuring GitHub Actions runner in \$runner_mode mode...\"
-          cd /opt/runner
-          
-          # Remove existing config
-          sudo -u runner ./config.sh remove --token \"\$RUNNER_TOKEN\" 2>/dev/null || true
-          
-          # Create work directory
-          mkdir -p /tmp/runner-work
-          chown runner:runner /tmp/runner-work
-          
-          # Configure runner
-          sudo -u runner ./config.sh \\
-              --url \"\$GITHUB_URL\" \\
-              --token \"\$RUNNER_TOKEN\" \\
-              --name \"\${RUNNER_NAME:-\$(hostname)}\" \\
-              --labels \"\${RUNNER_LABELS:-firecracker}\" \\
-              --work \"/tmp/runner-work\" \\
-              --unattended --replace || {
-              log \"ERROR: Runner configuration failed\"
-              return 1
-          }
-          
-          log \"✅ Runner configured successfully\"
-          return 0
-      }
+log() {
+    echo "[$(date +'\''%Y-%m-%d %H:%M:%S'\''] $1" | tee -a /var/log/setup-runner.log
+}
 
-      log \"=== Systemd-Mode GitHub Actions Runner Setup ===\"
+log "=== Systemd-Mode GitHub Actions Runner Setup ==="
 
-      # Wait for network
-      for i in {1..30}; do
-          if curl -s --connect-timeout 3 https://api.github.com/zen >/dev/null; then
-              log \"Network ready\"
-              break
-          fi
-          [ \$i -eq 30 ] && exit 1
-          sleep 2
-      done
+if [ -f /etc/environment ]; then
+    set -a
+    source /etc/environment
+    set +a
+fi
 
-      # Start Docker and setup networking
-      systemctl start docker
-      usermod -aG docker runner
-      setup_docker_networking
-      
-      # Setup runner
-      setup_github_runner \"systemd\"
+if [ -z "${RUNNER_TOKEN:-}" ] || [ -z "${GITHUB_URL:-}" ]; then
+    log "ERROR: Missing required environment variables"
+    exit 1
+fi
 
-      # Start systemd service
-      systemctl start github-runner
+for i in {1..30}; do
+    if curl -s --connect-timeout 3 https://api.github.com/zen >/dev/null; then
+        break
+    fi
+    if [ $i -eq 30 ]; then
+        exit 1
+    fi
+    sleep 2
+done
 
-      log \"=== Setup Complete ===\""
+systemctl start docker
+usermod -aG docker runner
+
+cd /opt/runner
+sudo -u runner ./config.sh --url "$GITHUB_URL" --token "$RUNNER_TOKEN" --name "$(hostname)" --labels "firecracker" --unattended --replace
+systemctl start github-runner
+
+log "=== Setup Complete ==="'
         fi
+        
+        # Create temporary file for setup script content
+        echo "$setup_script_content" > cloud-init/setup-script-temp.sh
         
         cat > cloud-init/user-data <<EOF
 #cloud-config
@@ -1716,21 +1351,43 @@ write_files:
   - path: /usr/local/bin/setup-runner.sh
     permissions: '0755'
     content: |
-$(echo "$setup_script_content" | sed 's/^/      /')
+EOF
+        
+        # Add the setup script content with proper indentation
+        sed 's/^/      /' cloud-init/setup-script-temp.sh >> cloud-init/user-data
+        
+        # Continue with the rest of the cloud-init config
+        cat >> cloud-init/user-data <<EOF
   - path: /etc/systemd/network/10-eth0.network
     content: |${network_config}
 
 runcmd:
   - systemctl enable systemd-networkd
   - systemctl restart systemd-networkd
-$(if [ "$arc_mode" = true ]; then echo "  - nohup /usr/local/bin/setup-runner.sh > /var/log/arc-runner.log 2>&1 &"; elif [ "$docker_mode" = true ]; then echo "  - nohup /usr/local/bin/setup-runner.sh > /var/log/docker-runner.log 2>&1 &"; else echo "  - /usr/local/bin/setup-runner.sh"; fi)
+EOF
+        
+        # Add the appropriate runcmd based on mode
+        if [ "$arc_mode" = true ]; then
+            echo "  - nohup /usr/local/bin/setup-runner.sh > /var/log/arc-runner.log 2>&1 &" >> cloud-init/user-data
+        elif [ "$docker_mode" = true ]; then
+            echo "  - nohup /usr/local/bin/setup-runner.sh > /var/log/docker-runner.log 2>&1 &" >> cloud-init/user-data
+        else
+            echo "  - /usr/local/bin/setup-runner.sh" >> cloud-init/user-data
+        fi
+        
+        cat >> cloud-init/user-data <<EOF
 
 ssh_pwauth: false
 EOF
-
+        
+        # Clean up temporary file
+        rm -f cloud-init/setup-script-temp.sh
+        
+        # Create network-config and meta-data
         echo "{}" > cloud-init/network-config
         echo "instance-id: ${vm_id}" > cloud-init/meta-data
         
+        # Create cloud-init ISO
         genisoimage -output cloud-init.iso -volid cidata -joliet -rock cloud-init/ >/dev/null 2>&1
     fi
     
