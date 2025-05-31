@@ -65,6 +65,40 @@ else
 	export PUSH_ARG="--push"
 endif
 
+# Help target to display available commands
+help:
+	@echo "Available targets:"
+	@echo ""
+	@echo "Build targets:"
+	@echo "  manager                          - Build manager binary"
+	@echo "  docker-build                     - Build standard Docker image"
+	@echo "  docker-build-firecracker         - Build Firecracker-enabled Docker image"
+	@echo "  docker-build-firecracker-optimized - Build optimized Firecracker Docker image"
+	@echo "  docker-buildx                    - Build multi-arch standard image"
+	@echo "  docker-buildx-firecracker        - Build multi-arch Firecracker image"
+	@echo "  docker-buildx-firecracker-optimized - Build multi-arch optimized Firecracker image"
+	@echo ""
+	@echo "Push targets:"
+	@echo "  docker-push                      - Push standard Docker images"
+	@echo "  docker-push-firecracker          - Push Firecracker Docker images"
+	@echo ""
+	@echo "Testing targets:"
+	@echo "  test                             - Run tests"
+	@echo "  test-with-deps                   - Run tests with dependencies"
+	@echo "  e2e                              - Run end-to-end tests"
+	@echo "  acceptance                       - Run acceptance tests"
+	@echo ""
+	@echo "Manifest targets:"
+	@echo "  manifests                        - Generate manifests (CRDs, RBAC, etc.)"
+	@echo "  install                          - Install CRDs into cluster"
+	@echo "  deploy                           - Deploy controller to cluster"
+	@echo ""
+	@echo "Environment variables:"
+	@echo "  DOCKER_IMAGE_NAME=${DOCKER_IMAGE_NAME}"
+	@echo "  VERSION=${VERSION}"
+	@echo "  PLATFORMS=${PLATFORMS}"
+	@echo "  IMG_RESULT=${IMG_RESULT} (options: load, cache, push)"
+
 all: manager
 
 lint:
@@ -205,6 +239,77 @@ generate: controller-gen
 # Run shellcheck on runner scripts
 shellcheck: shellcheck-install
 	$(TOOLS_PATH)/shellcheck --shell bash --source-path runner runner/*.sh hack/*.sh
+
+# Build standard Docker image
+docker-build:
+	docker build \
+		--build-arg RUNNER_VERSION=${RUNNER_VERSION} \
+		--build-arg VERSION=${VERSION} \
+		--build-arg COMMIT_SHA=${COMMIT_SHA} \
+		-t "${DOCKER_IMAGE_NAME}:${VERSION}" \
+		-f Dockerfile \
+		.
+
+# Build Firecracker-enabled Docker image
+docker-build-firecracker:
+	docker build \
+		--build-arg RUNNER_VERSION=${RUNNER_VERSION} \
+		--build-arg VERSION=${VERSION} \
+		--build-arg COMMIT_SHA=${COMMIT_SHA} \
+		-t "${DOCKER_IMAGE_NAME}:${VERSION}-firecracker" \
+		-t "${DOCKER_IMAGE_NAME}:firecracker-latest" \
+		-f Dockerfile \
+		.
+
+# Build optimized Firecracker Docker image using the minimal Dockerfile
+docker-build-firecracker-optimized:
+	docker build \
+		--build-arg RUNNER_VERSION=${RUNNER_VERSION} \
+		--build-arg VERSION=${VERSION} \
+		--build-arg COMMIT_SHA=${COMMIT_SHA} \
+		-t "${DOCKER_IMAGE_NAME}:${VERSION}-firecracker-optimized" \
+		-t "${DOCKER_IMAGE_NAME}:firecracker-optimized" \
+		-f Dockerfile.firecracker \
+		.
+
+# Build multi-arch Firecracker image using buildx
+docker-buildx-firecracker:
+	export DOCKER_CLI_EXPERIMENTAL=enabled ;\
+	export DOCKER_BUILDKIT=1
+	@if ! docker buildx ls | grep -q container-builder; then\
+		docker buildx create --platform ${PLATFORMS} --name container-builder --use;\
+	fi
+	docker buildx build --platform ${PLATFORMS} \
+		--build-arg RUNNER_VERSION=${RUNNER_VERSION} \
+		--build-arg VERSION=${VERSION} \
+		--build-arg COMMIT_SHA=${COMMIT_SHA} \
+		-t "${DOCKER_IMAGE_NAME}:${VERSION}-firecracker" \
+		-t "${DOCKER_IMAGE_NAME}:firecracker-latest" \
+		-f Dockerfile \
+		. ${PUSH_ARG}
+
+# Build optimized multi-arch Firecracker image using buildx
+docker-buildx-firecracker-optimized:
+	export DOCKER_CLI_EXPERIMENTAL=enabled ;\
+	export DOCKER_BUILDKIT=1
+	@if ! docker buildx ls | grep -q container-builder; then\
+		docker buildx create --platform ${PLATFORMS} --name container-builder --use;\
+	fi
+	docker buildx build --platform ${PLATFORMS} \
+		--build-arg RUNNER_VERSION=${RUNNER_VERSION} \
+		--build-arg VERSION=${VERSION} \
+		--build-arg COMMIT_SHA=${COMMIT_SHA} \
+		-t "${DOCKER_IMAGE_NAME}:${VERSION}-firecracker-optimized" \
+		-t "${DOCKER_IMAGE_NAME}:firecracker-optimized" \
+		-f Dockerfile.firecracker \
+		. ${PUSH_ARG}
+
+# Push Firecracker Docker images
+docker-push-firecracker:
+	docker push ${DOCKER_IMAGE_NAME}:${VERSION}-firecracker
+	docker push ${DOCKER_IMAGE_NAME}:firecracker-latest
+	docker push ${DOCKER_IMAGE_NAME}:${VERSION}-firecracker-optimized
+	docker push ${DOCKER_IMAGE_NAME}:firecracker-optimized
 
 docker-buildx:
 	export DOCKER_CLI_EXPERIMENTAL=enabled ;\

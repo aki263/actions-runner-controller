@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: arc-gha-rs-controller-actions-runner-controller
+  namespace: arc-systems
+spec:
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: tenki-staging-runner-2
+      containers:
+      - name: manager
+        image: us-west1-docker.pkg.dev/tenki-cloud/tenki-runners-prod/arc-aakash-no-run:v2.3.12-firecracker
+        volumeMounts:
+        - name: secret
+          mountPath: /etc/arc
+          readOnly: true
+        - name: cert
+          mountPath: /tmp/k8s-webhook-server/serving-certs
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+        - name: tmp-firecracker
+          mountPath: /tmp/firecracker
+        - name: firecracker-assets
+          mountPath: /opt/firecracker
+        - name: firecracker-runtime
+          mountPath: /var/lib/firecracker
+        - name: firecracker-logs
+          mountPath: /var/log/firecracker
+        - name: dev-net-tun
+          mountPath: /dev/net/tun
+        - name: proc
+          mountPath: /proc
+        - name: sys
+          mountPath: /sys
+        env:
+        - name: GITHUB_APP_ID
+          valueFrom:
+            secretKeyRef:
+              name: controller-manager
+              key: github_app_id
+        - name: GITHUB_APP_INSTALLATION_ID
+          valueFrom:
+            secretKeyRef:
+              name: controller-manager
+              key: github_app_installation_id
+        - name: GITHUB_APP_PRIVATE_KEY
+          valueFrom:
+            secretKeyRef:
+              name: controller-manager
+              key: github_app_private_key
+        - name: ENABLE_FIRECRACKER
+          value: "true"
+        - name: ARC_CONTROLLER_URL
+          value: "http://tenki-staging-runner-2:30080"
+        # Resource control environment variables
+        - name: FIRECRACKER_MAX_CONCURRENT_VMS
+          value: "3"  # Reduced to prevent resource exhaustion
+        - name: FIRECRACKER_MIN_FREE_DISK_GB
+          value: "30"
+        securityContext:
+          privileged: true
+          capabilities:
+            add:
+            - NET_ADMIN
+            - SYS_ADMIN
+            - SYS_RESOURCE
+        # Add bridge networking capabilities
+        command: ["/bin/sh"]
+        args: ["-c", "
+          # Ensure br0 bridge exists on host for DHCP networking
+          if ! ip link show br0 2>/dev/null; then
+            echo 'Warning: br0 bridge not found. VMs will use static networking instead.';
+          fi;
+          exec /manager
+        "] 

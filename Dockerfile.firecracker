@@ -1,0 +1,117 @@
+# Build the manager binary
+FROM golang:1.21-alpine as builder
+
+# Install build dependencies
+RUN apk add --no-cache git ca-certificates
+
+WORKDIR /workspace
+
+# Copy the Go Modules manifests
+COPY go.mod go.mod
+COPY go.sum go.sum
+
+# Download dependencies
+RUN go mod download
+
+# Copy the go source
+COPY main.go main.go
+COPY apis/ apis/
+COPY controllers/ controllers/
+COPY github/ github/
+COPY logging/ logging/
+COPY build/ build/
+COPY hash/ hash/
+COPY cmd/ cmd/
+COPY pkg/ pkg/
+COPY simulator/ simulator/
+
+# Build all required binaries with optimizations
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -ldflags="-w -s" -o manager main.go
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -ldflags="-w -s" -o github-webhook-server ./cmd/githubwebhookserver
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -ldflags="-w -s" -o actions-metrics-server ./cmd/actionsmetricsserver
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -ldflags="-w -s" -o github-runnerscaleset-listener ./cmd/githubrunnerscalesetlistener
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -ldflags="-w -s" -o sleep ./cmd/sleep
+
+# Production image with minimal Firecracker dependencies
+FROM ubuntu:22.04
+
+# Set environment variables to prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+# Install only essential packages for Firecracker support
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Essential network utilities
+    iproute2 \
+    bridge-utils \
+    iptables \
+    dnsmasq \
+    # Cloud-init essentials
+    cloud-image-utils \
+    cloud-init \
+    # Essential file system utilities
+    util-linux \
+    e2fsprogs \
+    # Process utilities
+    procps \
+    # Download utilities
+    wget \
+    curl \
+    # Security
+    ca-certificates \
+    # Clean up
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean \
+    && rm -rf /tmp/* /var/tmp/*
+
+# Install Firecracker from GitHub releases
+RUN ARCH="$(uname -m)" && \
+    release_url="https://github.com/firecracker-microvm/firecracker/releases" && \
+    latest=$(basename $(curl -fsSLI -o /dev/null -w %{url_effective} ${release_url}/latest)) && \
+    curl -L ${release_url}/download/${latest}/firecracker-${latest}-${ARCH}.tgz | tar -xz && \
+    mv release-${latest}-${ARCH}/firecracker-${latest}-${ARCH} /usr/local/bin/firecracker && \
+    mv release-${latest}-${ARCH}/jailer-${latest}-${ARCH} /usr/local/bin/jailer && \
+    chmod +x /usr/local/bin/firecracker /usr/local/bin/jailer && \
+    rm -rf release-${latest}-${ARCH}
+
+# Create required directories with proper structure
+RUN mkdir -p /opt/firecracker/{kernels,images,snapshots,vm-configs} \
+    && mkdir -p /var/lib/firecracker/vms \
+    && mkdir -p /tmp/firecracker \
+    && mkdir -p /var/log/firecracker
+
+# Create controller user and group
+RUN groupadd -r -g 1000 controller && \
+    useradd -r -u 1000 -g controller -d /home/controller -m controller
+
+# Copy binaries from builder
+WORKDIR /
+COPY --from=builder /workspace/manager .
+COPY --from=builder /workspace/github-webhook-server .
+COPY --from=builder /workspace/actions-metrics-server .
+COPY --from=builder /workspace/github-runnerscaleset-listener .
+COPY --from=builder /workspace/sleep .
+
+# Set proper ownership and permissions
+RUN chown -R controller:controller /opt/firecracker \
+    && chown -R controller:controller /var/lib/firecracker \
+    && chown -R controller:controller /tmp/firecracker \
+    && chown -R controller:controller /var/log/firecracker \
+    && chmod +x /manager /github-webhook-server /actions-metrics-server /github-runnerscaleset-listener /sleep
+
+# Create minimal firecracker configuration
+RUN echo '{}' > /opt/firecracker/default-config.json && \
+    chown controller:controller /opt/firecracker/default-config.json
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD ps aux | grep -q "[m]anager" || exit 1
+
+# Run as root for Firecracker VM management privileges
+# This is required for network bridge operations and VM lifecycle management
+USER root
+
+# Expose default ports (can be overridden)
+EXPOSE 8080 8443
+
+ENTRYPOINT ["/manager"] 

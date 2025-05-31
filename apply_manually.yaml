@@ -1,0 +1,81 @@
+---
+# Copy these commands and run on your k8s cluster node:
+
+# 1. First check current deployment
+echo "=== Current deployment status ==="
+kubectl get deployment arc-gha-rs-controller-actions-runner-controller -n arc-systems -o yaml | grep -A5 -B5 image:
+
+# 2. Check if there are active runners to scale down
+echo "=== Scaling down runners ==="
+kubectl get runners -A
+kubectl get runnerdeployments -A  
+kubectl get hra -A
+
+# Scale down any found runners
+kubectl scale runnerdeployment -n arc-runners tenki-staging-firecracker --replicas=0 || echo "No RD found"
+kubectl patch hra -n arc-runners tenki-staging-firecracker --type='merge' -p='{"spec":{"minReplicas":0,"maxReplicas":0}}' || echo "No HRA found"
+kubectl delete runners -n arc-runners --all || echo "No runners to delete"
+
+# 3. Apply the new image and configuration
+echo "=== Updating deployment to v2.3.12-firecracker ==="
+kubectl patch deployment arc-gha-rs-controller-actions-runner-controller -n arc-systems --type='merge' -p='{
+  "spec": {
+    "template": {
+      "spec": {
+        "nodeSelector": {
+          "kubernetes.io/hostname": "tenki-staging-runner-2"
+        },
+        "containers": [{
+          "name": "manager",
+          "image": "us-west1-docker.pkg.dev/tenki-cloud/tenki-runners-prod/arc-aakash-no-run:v2.3.12-firecracker",
+          "env": [
+            {"name": "GITHUB_APP_ID", "valueFrom": {"secretKeyRef": {"name": "controller-manager", "key": "github_app_id"}}},
+            {"name": "GITHUB_APP_INSTALLATION_ID", "valueFrom": {"secretKeyRef": {"name": "controller-manager", "key": "github_app_installation_id"}}},
+            {"name": "GITHUB_APP_PRIVATE_KEY", "valueFrom": {"secretKeyRef": {"name": "controller-manager", "key": "github_app_private_key"}}},
+            {"name": "ENABLE_FIRECRACKER", "value": "true"},
+            {"name": "ARC_CONTROLLER_URL", "value": "http://tenki-staging-runner-2:30080"},
+            {"name": "FIRECRACKER_MAX_CONCURRENT_VMS", "value": "3"},
+            {"name": "FIRECRACKER_MIN_FREE_DISK_GB", "value": "30"}
+          ]
+        }]
+      }
+    }
+  }
+}'
+
+# 4. Wait for rollout
+echo "=== Waiting for deployment rollout ==="
+kubectl rollout status deployment/arc-gha-rs-controller-actions-runner-controller -n arc-systems --timeout=300s
+
+# 5. Check new pod status
+echo "=== Checking new pod ==="
+kubectl get pods -n arc-systems -l app.kubernetes.io/name=actions-runner-controller
+
+# 6. Check pod logs for new resource controls
+echo "=== Checking logs for resource control messages ==="
+POD_NAME=$(kubectl get pods -n arc-systems -l app.kubernetes.io/name=actions-runner-controller -o jsonpath='{.items[0].metadata.name}')
+echo "Pod name: $POD_NAME"
+kubectl logs $POD_NAME -n arc-systems | tail -20
+
+# 7. Test with one runner
+echo "=== Testing with 1 runner ==="
+kubectl scale runnerdeployment -n arc-runners tenki-staging-firecracker --replicas=1 || echo "No RD, trying HRA..."
+kubectl patch hra -n arc-runners tenki-staging-firecracker --type='merge' -p='{"spec":{"minReplicas":1,"maxReplicas":1}}' || echo "No HRA found"
+
+# 8. Monitor for 60 seconds
+echo "=== Monitoring VM creation for 60 seconds ==="
+kubectl logs -f $POD_NAME -n arc-systems &
+LOGS_PID=$!
+sleep 60
+kill $LOGS_PID
+
+# 9. Final status check
+echo "=== Final status ==="
+kubectl get runners -A
+kubectl get events -n arc-runners | grep -i firecracker | tail -10
+
+# 10. Check VM console logs if available
+echo "=== Checking VM instances ==="
+kubectl exec -n arc-systems $POD_NAME -- find /opt/firecracker/data/instances -name "console.log" 2>/dev/null || echo "No VM instances yet"
+
+echo "=== Deployment completed ===" 

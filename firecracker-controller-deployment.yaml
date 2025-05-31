@@ -1,0 +1,207 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: actions-runner-controller-firecracker
+  namespace: actions-runner-system
+  labels:
+    app.kubernetes.io/name: actions-runner-controller
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/version: firecracker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: actions-runner-controller
+      app.kubernetes.io/component: controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: actions-runner-controller
+        app.kubernetes.io/component: controller
+        app.kubernetes.io/version: firecracker
+    spec:
+      serviceAccountName: actions-runner-controller
+      securityContext:
+        # Required for Firecracker VM management
+        runAsUser: 0
+        runAsGroup: 0
+        fsGroup: 0
+      containers:
+      - name: manager
+        image: summerwind/actions-runner-controller:firecracker-latest
+        imagePullPolicy: IfNotPresent
+        command:
+        - /manager
+        args:
+        - --metrics-addr=0.0.0.0:8080
+        - --enable-leader-election
+        - --log-level=info
+        - --log-format=text
+        env:
+        - name: RUNTIME_CLASS_NAME
+          value: "firecracker"
+        - name: FIRECRACKER_KERNEL_PATH
+          value: "/opt/firecracker/kernels"
+        - name: FIRECRACKER_ROOTFS_PATH
+          value: "/opt/firecracker/images"
+        - name: FIRECRACKER_SNAPSHOTS_PATH
+          value: "/opt/firecracker/snapshots"
+        - name: FIRECRACKER_VM_PATH
+          value: "/var/lib/firecracker/vms"
+        ports:
+        - containerPort: 8080
+          name: metrics
+          protocol: TCP
+        - containerPort: 8443
+          name: webhook
+          protocol: TCP
+        livenessProbe:
+          httpGet:
+            path: /metrics
+            port: metrics
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /metrics
+            port: metrics
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+        resources:
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+          requests:
+            cpu: 500m
+            memory: 1Gi
+        securityContext:
+          # Privileged mode required for Firecracker VM management
+          privileged: true
+          allowPrivilegeEscalation: true
+          capabilities:
+            add:
+            - NET_ADMIN
+            - SYS_ADMIN
+            - SYS_RESOURCE
+        volumeMounts:
+        # Firecracker asset directories
+        - name: firecracker-kernels
+          mountPath: /opt/firecracker/kernels
+        - name: firecracker-images
+          mountPath: /opt/firecracker/images
+        - name: firecracker-snapshots
+          mountPath: /opt/firecracker/snapshots
+        # VM runtime directories
+        - name: firecracker-vms
+          mountPath: /var/lib/firecracker/vms
+        - name: firecracker-tmp
+          mountPath: /tmp/firecracker
+        # Host networking access for bridge management
+        - name: proc
+          mountPath: /host/proc
+          readOnly: true
+        - name: sys
+          mountPath: /host/sys
+          readOnly: true
+        # TLS certificates (if using webhook)
+        - name: cert
+          mountPath: /tmp/k8s-webhook-server/serving-certs
+          readOnly: true
+      # Host network mode for better VM networking support
+      hostNetwork: false
+      dnsPolicy: ClusterFirst
+      terminationGracePeriodSeconds: 30
+      volumes:
+      # Persistent volumes for Firecracker assets
+      - name: firecracker-kernels
+        hostPath:
+          path: /opt/firecracker/kernels
+          type: DirectoryOrCreate
+      - name: firecracker-images
+        hostPath:
+          path: /opt/firecracker/images
+          type: DirectoryOrCreate
+      - name: firecracker-snapshots
+        hostPath:
+          path: /opt/firecracker/snapshots
+          type: DirectoryOrCreate
+      # VM runtime directories
+      - name: firecracker-vms
+        hostPath:
+          path: /var/lib/firecracker/vms
+          type: DirectoryOrCreate
+      - name: firecracker-tmp
+        emptyDir:
+          sizeLimit: 10Gi
+      # Host system directories (read-only)
+      - name: proc
+        hostPath:
+          path: /proc
+      - name: sys
+        hostPath:
+          path: /sys
+      # TLS certificates
+      - name: cert
+        secret:
+          defaultMode: 420
+          secretName: webhook-server-cert
+      nodeSelector:
+        # Deploy only on nodes that support Firecracker
+        firecracker.io/enabled: "true"
+      tolerations:
+      - key: firecracker.io/node
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: actions-runner-controller-firecracker
+  namespace: actions-runner-system
+  labels:
+    app.kubernetes.io/name: actions-runner-controller
+    app.kubernetes.io/component: controller
+spec:
+  type: ClusterIP
+  ports:
+  - name: metrics
+    port: 8080
+    targetPort: 8080
+    protocol: TCP
+  - name: webhook
+    port: 8443
+    targetPort: 8443
+    protocol: TCP
+  selector:
+    app.kubernetes.io/name: actions-runner-controller
+    app.kubernetes.io/component: controller
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: actions-runner-controller-firecracker-nodeport
+  namespace: actions-runner-system
+  labels:
+    app.kubernetes.io/name: actions-runner-controller
+    app.kubernetes.io/component: controller-nodeport
+spec:
+  type: NodePort
+  ports:
+  - name: metrics
+    port: 8080
+    targetPort: 8080
+    nodePort: 30080
+    protocol: TCP
+  - name: webhook
+    port: 8443
+    targetPort: 8443
+    nodePort: 30081
+    protocol: TCP
+  selector:
+    app.kubernetes.io/name: actions-runner-controller
+    app.kubernetes.io/component: controller 

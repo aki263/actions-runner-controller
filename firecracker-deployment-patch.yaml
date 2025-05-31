@@ -1,0 +1,68 @@
+spec:
+  template:
+    spec:
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+        fsGroup: 0
+      containers:
+      - name: manager
+        securityContext:
+          privileged: true
+          allowPrivilegeEscalation: true
+          capabilities:
+            add:
+            - NET_ADMIN
+            - SYS_ADMIN
+            - SYS_RESOURCE
+        env:
+        - name: FIRECRACKER_ENABLED
+          value: "true"
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        volumeMounts:
+        - name: firecracker-assets
+          mountPath: /opt/firecracker
+        - name: firecracker-runtime
+          mountPath: /var/lib/firecracker
+        - name: firecracker-logs
+          mountPath: /var/log/firecracker
+        - name: tmp-firecracker
+          mountPath: /tmp/firecracker
+        - name: dev-net-tun
+          mountPath: /dev/net/tun
+        - name: proc
+          mountPath: /host/proc
+          readOnly: true
+        - name: sys
+          mountPath: /host/sys
+          readOnly: true
+      volumes:
+      - name: firecracker-assets
+        hostPath:
+          path: /opt/firecracker
+          type: DirectoryOrCreate
+      - name: firecracker-runtime
+        hostPath:
+          path: /var/lib/firecracker
+          type: DirectoryOrCreate
+      - name: firecracker-logs
+        hostPath:
+          path: /var/log/firecracker
+          type: DirectoryOrCreate
+      - name: tmp-firecracker
+        emptyDir: {}
+      - name: dev-net-tun
+        hostPath:
+          path: /dev/net/tun
+          type: CharDevice
+      - name: proc
+        hostPath:
+          path: /proc
+          type: Directory
+      - name: sys
+        hostPath:
+          path: /sys
+          type: Directory 

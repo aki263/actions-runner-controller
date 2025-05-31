@@ -1,14 +1,64 @@
-Makefile
-acceptance
-runner
-hack
-test-assets
-config
-charts
-.github
-.envrc
-.env
+# Git files
+.git
+.gitignore
+.gitattributes
+
+# Documentation
 *.md
-*.txt
-*.sh
-test/e2e/.docker-build
+docs/
+example-*
+
+# Test files
+*_test.go
+test/
+tests/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+/tmp/
+
+# Build artifacts (keep only source)
+bin/
+dist/
+*.exe
+
+# Node.js (if any)
+node_modules/
+npm-debug.log
+
+# Docker files
+Dockerfile*
+docker-compose*
+
+# Kubernetes manifests
+*.yaml
+*.yml
+manifests/
+config/
+
+# CI/CD
+.github/
+.circleci/
+.travis.yml
+
+# Other
+hack/
+vendor/
