@@ -1,0 +1,200 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: firecracker-vm-daemon
+  namespace: arc-systems
+  labels:
+    app: firecracker-vm-daemon
+    component: vm-host-manager
+spec:
+  selector:
+    matchLabels:
+      app: firecracker-vm-daemon
+  template:
+    metadata:
+      labels:
+        app: firecracker-vm-daemon
+        component: vm-host-manager
+    spec:
+      hostNetwork: true
+      hostPID: true
+      hostIPC: true
+      serviceAccountName: firecracker-vm-daemon
+      tolerations:
+      - operator: Exists
+        effect: NoSchedule
+      - operator: Exists
+        effect: NoExecute
+      nodeSelector:
+        # Only run on nodes that have Firecracker support
+        kubernetes.io/hostname: tenki-staging-runner-2
+      containers:
+      - name: vm-daemon
+        image: python:3.11-slim
+        imagePullPolicy: IfNotPresent
+        command:
+        - /bin/bash
+        - -c
+        - |
+          # Install required packages
+          apt-get update && apt-get install -y curl wget jq openssh-client genisoimage
+          
+          # Install Firecracker (if not already available on host)
+          if ! command -v firecracker &> /dev/null; then
+            wget -q https://github.com/firecracker-microvm/firecracker/releases/download/v1.12.0/firecracker-v1.12.0-x86_64.tgz
+            tar -xzf firecracker-v1.12.0-x86_64.tgz
+            cp release-v1.12.0-x86_64/firecracker-v1.12.0-x86_64 /usr/local/bin/firecracker
+            chmod +x /usr/local/bin/firecracker
+          fi
+          
+          # Start the VM daemon
+          exec python3 /app/firecracker-vm-daemon.py
+        ports:
+        - name: http-api
+          containerPort: 8090
+          hostPort: 8090
+        env:
+        - name: DAEMON_PORT
+          value: "8090"
+        - name: FIRECRACKER_WORK_DIR
+          value: "/host/opt/firecracker"
+        - name: FIRECRACKER_SCRIPT
+          value: "/app/firecracker-complete.sh"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        securityContext:
+          privileged: true
+          capabilities:
+            add:
+            - NET_ADMIN
+            - SYS_ADMIN
+            - NET_RAW
+        volumeMounts:
+        - name: host-root
+          mountPath: /host
+        - name: host-dev
+          mountPath: /dev
+        - name: host-proc
+          mountPath: /host/proc
+        - name: host-sys
+          mountPath: /host/sys
+        - name: firecracker-script
+          mountPath: /app/firecracker-complete.sh
+          subPath: firecracker-complete.sh
+        - name: vm-daemon-script
+          mountPath: /app/firecracker-vm-daemon.py
+          subPath: firecracker-vm-daemon.py
+        - name: firecracker-work
+          mountPath: /opt/firecracker
+        - name: dev-kvm
+          mountPath: /dev/kvm
+        - name: dev-net-tun
+          mountPath: /dev/net/tun
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8090
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8090
+          initialDelaySeconds: 10
+          periodSeconds: 10
+      volumes:
+      - name: host-root
+        hostPath:
+          path: /
+          type: Directory
+      - name: host-dev
+        hostPath:
+          path: /dev
+          type: Directory
+      - name: host-proc
+        hostPath:
+          path: /proc
+          type: Directory
+      - name: host-sys
+        hostPath:
+          path: /sys
+          type: Directory
+      - name: firecracker-script
+        configMap:
+          name: firecracker-scripts
+          defaultMode: 0755
+      - name: vm-daemon-script
+        configMap:
+          name: firecracker-scripts
+          defaultMode: 0755
+      - name: firecracker-work
+        hostPath:
+          path: /opt/firecracker
+          type: DirectoryOrCreate
+      - name: dev-kvm
+        hostPath:
+          path: /dev/kvm
+          type: CharDevice
+      - name: dev-net-tun
+        hostPath:
+          path: /dev/net/tun
+          type: CharDevice
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: firecracker-vm-daemon
+  namespace: arc-systems
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: firecracker-vm-daemon
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "create", "delete"]
+- apiGroups: ["apps"]
+  resources: ["daemonsets"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: firecracker-vm-daemon
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: firecracker-vm-daemon
+subjects:
+- kind: ServiceAccount
+  name: firecracker-vm-daemon
+  namespace: arc-systems
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: firecracker-vm-daemon
+  namespace: arc-systems
+  labels:
+    app: firecracker-vm-daemon
+spec:
+  type: NodePort
+  selector:
+    app: firecracker-vm-daemon
+  ports:
+  - name: http-api
+    port: 8090
+    targetPort: 8090
+    nodePort: 30090
+    protocol: TCP 

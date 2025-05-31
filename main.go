@@ -285,18 +285,26 @@ func main() {
 		)
 
 		// Initialize FirecrackerVMManager if enabled
-		var firecrackerVMManager *actionssummerwindnet.FirecrackerVMManager
+		var firecrackerVMManager actionssummerwindnet.VMManager
 		if os.Getenv("ENABLE_FIRECRACKER") == "true" {
-			arcControllerURL := os.Getenv("ARC_CONTROLLER_URL")
-			if arcControllerURL == "" {
-				arcControllerURL = "http://localhost:30080" // Default
+			// Use host-based DaemonSet API for proper bridge networking
+			daemonAPIURL := os.Getenv("FIRECRACKER_DAEMON_URL")
+			if daemonAPIURL == "" {
+				daemonAPIURL = "http://192.168.21.32:30090" // Default to host node with DaemonSet
 			}
-			firecrackerVMManager = actionssummerwindnet.NewFirecrackerVMManager(
-				mgr.GetClient(),
-				log.WithName("firecracker-vm-manager"),
-				arcControllerURL,
+			
+			hostVMManager := actionssummerwindnet.NewHostFirecrackerVMManager(
+				log.WithName("host-firecracker-vm-manager"),
+				daemonAPIURL,
 			)
-			log.Info("Firecracker VM Manager initialized", "arcControllerURL", arcControllerURL)
+			
+			// Wrap with interface adapter
+			firecrackerVMManager = &actionssummerwindnet.VMManagerAdapter{
+				HostManager: hostVMManager,
+				Log:         log.WithName("vm-manager-adapter"),
+			}
+			
+			log.Info("Host-based Firecracker VM Manager initialized", "daemonAPIURL", daemonAPIURL)
 		}
 
 		runnerReconciler := &actionssummerwindnet.RunnerReconciler{

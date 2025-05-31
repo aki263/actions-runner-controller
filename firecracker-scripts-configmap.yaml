@@ -1,0 +1,663 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: firecracker-scripts
+  namespace: arc-systems
+data:
+  firecracker-complete.sh: |
+    #!/bin/bash
+    # firecracker-complete.sh - Complete Firecracker VM Management Script
+    # This script manages Firecracker VMs with host bridge networking
+
+    set -euo pipefail
+
+    # Configuration
+    WORK_DIR="/opt/firecracker"
+    VM_DIR="$WORK_DIR/vms"
+    KERNEL_PATH="$WORK_DIR/vmlinux.bin"
+    ROOTFS_PATH="$WORK_DIR/rootfs.ext4"
+    FIRECRACKER_BIN="/usr/local/bin/firecracker"
+    GITHUB_ACTIONS_DIR="/opt/actions-runner"
+
+    # Logging function
+    log() {
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2
+    }
+
+    # Error handling
+    error_exit() {
+        log "ERROR: $1"
+        exit 1
+    }
+
+    # Check if running as root
+    check_root() {
+        if [[ $EUID -ne 0 ]]; then
+            error_exit "This script must be run as root for bridge networking"
+        fi
+    }
+
+    # Initialize working directory
+    init_work_dir() {
+        mkdir -p "$VM_DIR" "$GITHUB_ACTIONS_DIR"
+        cd "$WORK_DIR"
+        log "Working directory: $WORK_DIR"
+    }
+
+    # Download kernel if needed
+    download_kernel() {
+        if [[ ! -f "$KERNEL_PATH" ]]; then
+            log "Downloading kernel..."
+            wget -q -O "$KERNEL_PATH" https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/kernels/vmlinux.bin
+        fi
+    }
+
+    # Download rootfs if needed
+    download_rootfs() {
+        if [[ ! -f "$ROOTFS_PATH" ]]; then
+            log "Downloading rootfs..."
+            wget -q -O "$ROOTFS_PATH" https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/rootfs/ubuntu-18.04.ext4
+        fi
+    }
+
+    # Create TAP interface for VM
+    create_tap_interface() {
+        local vm_name="$1"
+        local tap_name="tap-${vm_name}"
+        
+        if ! ip link show "$tap_name" >/dev/null 2>&1; then
+            log "Creating TAP interface: $tap_name"
+            ip tuntap add "$tap_name" mode tap
+            ip link set "$tap_name" up
+            
+            # Add to host bridge br0
+            if ip link show br0 >/dev/null 2>&1; then
+                ip link set "$tap_name" master br0
+                log "Added $tap_name to bridge br0"
+            else
+                log "WARNING: Bridge br0 not found, TAP interface created but not bridged"
+            fi
+        fi
+        echo "$tap_name"
+    }
+
+    # Remove TAP interface
+    remove_tap_interface() {
+        local tap_name="$1"
+        if ip link show "$tap_name" >/dev/null 2>&1; then
+            log "Removing TAP interface: $tap_name"
+            ip link delete "$tap_name"
+        fi
+    }
+
+    # Create VM configuration
+    create_vm_config() {
+        local vm_name="$1"
+        local memory_mb="${2:-8192}"
+        local vcpus="${3:-4}"
+        local tap_name="$4"
+        
+        local config_file="$VM_DIR/${vm_name}.json"
+        
+        cat > "$config_file" << EOF
+    {
+      "boot-source": {
+        "kernel_image_path": "$KERNEL_PATH",
+        "boot_args": "console=ttyS0 reboot=k panic=1 pci=off"
+      },
+      "drives": [
+        {
+          "drive_id": "rootfs",
+          "path_on_host": "$ROOTFS_PATH",
+          "is_root_device": true,
+          "is_read_only": false
+        }
+      ],
+      "machine-config": {
+        "vcpu_count": $vcpus,
+        "mem_size_mib": $memory_mb,
+        "ht_enabled": false
+      },
+      "network-interfaces": [
+        {
+          "iface_id": "eth0",
+          "guest_mac": "AA:FC:00:00:00:01",
+          "host_dev_name": "$tap_name"
+        }
+      ]
+    }
+    EOF
+        
+        echo "$config_file"
+    }
+
+    # Launch VM
+    launch_vm() {
+        local vm_name="$1"
+        local memory_mb="${2:-8192}"
+        local vcpus="${3:-4}"
+        local github_url="${4:-}"
+        local github_token="${5:-}"
+        local labels="${6:-firecracker}"
+        
+        check_root
+        init_work_dir
+        download_kernel
+        download_rootfs
+        
+        log "Launching VM: $vm_name"
+        
+        # Create TAP interface
+        local tap_name
+        tap_name=$(create_tap_interface "$vm_name")
+        
+        # Create VM configuration
+        local config_file
+        config_file=$(create_vm_config "$vm_name" "$memory_mb" "$vcpus" "$tap_name")
+        
+        # Create socket path
+        local socket_path="$VM_DIR/${vm_name}.socket"
+        
+        # Launch Firecracker
+        log "Starting Firecracker with config: $config_file"
+        "$FIRECRACKER_BIN" --api-sock "$socket_path" --config-file "$config_file" &
+        local fc_pid=$!
+        
+        # Store VM metadata
+        cat > "$VM_DIR/${vm_name}.meta" << EOF
+    VM_NAME=$vm_name
+    PID=$fc_pid
+    SOCKET=$socket_path
+    TAP_INTERFACE=$tap_name
+    MEMORY_MB=$memory_mb
+    VCPUS=$vcpus
+    GITHUB_URL=$github_url
+    GITHUB_TOKEN=$github_token
+    LABELS=$labels
+    CREATED=$(date -Iseconds)
+    EOF
+        
+        log "VM $vm_name launched successfully (PID: $fc_pid)"
+        echo "VM launched: $vm_name (PID: $fc_pid, TAP: $tap_name)"
+    }
+
+    # Stop VM
+    stop_vm() {
+        local vm_name="$1"
+        local meta_file="$VM_DIR/${vm_name}.meta"
+        
+        if [[ ! -f "$meta_file" ]]; then
+            error_exit "VM $vm_name not found"
+        fi
+        
+        source "$meta_file"
+        
+        log "Stopping VM: $vm_name (PID: $PID)"
+        
+        # Kill Firecracker process
+        if kill -TERM "$PID" 2>/dev/null; then
+            sleep 2
+            if kill -0 "$PID" 2>/dev/null; then
+                kill -KILL "$PID"
+            fi
+        fi
+        
+        # Remove TAP interface
+        remove_tap_interface "$TAP_INTERFACE"
+        
+        # Clean up files
+        rm -f "$VM_DIR/${vm_name}."*
+        
+        log "VM $vm_name stopped successfully"
+    }
+
+    # List VMs
+    list_vms() {
+        log "Listing Firecracker VMs:"
+        
+        if [[ ! -d "$VM_DIR" ]]; then
+            echo "No VMs found (VM directory does not exist)"
+            return
+        fi
+        
+        local found_vms=false
+        for meta_file in "$VM_DIR"/*.meta; do
+            if [[ -f "$meta_file" ]]; then
+                found_vms=true
+                source "$meta_file"
+                local status="unknown"
+                if kill -0 "$PID" 2>/dev/null; then
+                    status="running"
+                else
+                    status="stopped"
+                fi
+                
+                echo "VM: $VM_NAME"
+                echo "  Status: $status"
+                echo "  PID: $PID"
+                echo "  TAP: $TAP_INTERFACE"
+                echo "  Memory: ${MEMORY_MB}MB"
+                echo "  vCPUs: $VCPUS"
+                echo "  Created: $CREATED"
+                echo "  GitHub URL: $GITHUB_URL"
+                echo "  Labels: $LABELS"
+                echo
+            fi
+        done
+        
+        if [[ "$found_vms" == false ]]; then
+            echo "No VMs found"
+        fi
+    }
+
+    # Get VM status
+    vm_status() {
+        local vm_name="$1"
+        local meta_file="$VM_DIR/${vm_name}.meta"
+        
+        if [[ ! -f "$meta_file" ]]; then
+            echo "VM $vm_name not found"
+            return 1
+        fi
+        
+        source "$meta_file"
+        
+        if kill -0 "$PID" 2>/dev/null; then
+            echo "VM $vm_name is running (PID: $PID)"
+        else
+            echo "VM $vm_name is stopped"
+        fi
+    }
+
+    # Show usage
+    usage() {
+        cat << EOF
+    Usage: $0 <command> [options]
+
+    Commands:
+      launch <name> [options]    Launch a new VM
+      stop <name>               Stop a VM
+      list                      List all VMs
+      status <name>             Show VM status
+
+    Launch Options:
+      --memory <MB>             Memory in MB (default: 8192)
+      --cpus <count>            vCPU count (default: 4)
+      --github-url <url>        GitHub repository URL
+      --github-token <token>    GitHub access token
+      --labels <labels>         Runner labels (default: firecracker)
+      --use-host-bridge         Use host bridge networking (default)
+      --arc-mode                ARC controller integration mode
+      --arc-controller-url <url> ARC controller URL
+      --ephemeral-mode          Ephemeral VM mode
+
+    Examples:
+      $0 launch vm1 --memory 4096 --cpus 2
+      $0 launch vm2 --github-url https://github.com/user/repo --github-token ghp_xxx
+      $0 stop vm1
+      $0 list
+      $0 status vm1
+    EOF
+    }
+
+    # Main command dispatch
+    main() {
+        case "${1:-}" in
+            launch)
+                if [[ $# -lt 2 ]]; then
+                    usage
+                    exit 1
+                fi
+                
+                local vm_name="$2"
+                local memory_mb=8192
+                local vcpus=4
+                local github_url=""
+                local github_token=""
+                local labels="firecracker"
+                
+                shift 2
+                while [[ $# -gt 0 ]]; do
+                    case $1 in
+                        --memory)
+                            memory_mb="$2"
+                            shift 2
+                            ;;
+                        --cpus)
+                            vcpus="$2"
+                            shift 2
+                            ;;
+                        --github-url)
+                            github_url="$2"
+                            shift 2
+                            ;;
+                        --github-token)
+                            github_token="$2"
+                            shift 2
+                            ;;
+                        --labels)
+                            labels="$2"
+                            shift 2
+                            ;;
+                        --use-host-bridge|--arc-mode|--ephemeral-mode)
+                            # Flags that don't need values
+                            shift
+                            ;;
+                        --arc-controller-url)
+                            # Skip ARC controller URL for now
+                            shift 2
+                            ;;
+                        --name)
+                            # Handle --name flag
+                            vm_name="$2"
+                            shift 2
+                            ;;
+                        *)
+                            log "Unknown option: $1"
+                            usage
+                            exit 1
+                            ;;
+                    esac
+                done
+                
+                launch_vm "$vm_name" "$memory_mb" "$vcpus" "$github_url" "$github_token" "$labels"
+                ;;
+            stop)
+                if [[ $# -ne 2 ]]; then
+                    usage
+                    exit 1
+                fi
+                stop_vm "$2"
+                ;;
+            list)
+                list_vms
+                ;;
+            status)
+                if [[ $# -ne 2 ]]; then
+                    usage
+                    exit 1
+                fi
+                vm_status "$2"
+                ;;
+            *)
+                usage
+                exit 1
+                ;;
+        esac
+    }
+
+    # Run main function
+    main "$@"
+
+  firecracker-vm-daemon.py: |
+    #!/usr/bin/env python3
+    """
+    Firecracker VM Daemon - Host-based VM management API
+    Wraps firecracker-complete.sh for Kubernetes integration
+    """
+
+    import os
+    import json
+    import subprocess
+    import threading
+    import time
+    from datetime import datetime
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    from urllib.parse import urlparse, parse_qs
+    import logging
+
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    logger = logging.getLogger(__name__)
+
+    class FirecrackerVMDaemon:
+        def __init__(self, work_dir="/opt/firecracker", script_path="/usr/local/bin/firecracker-complete.sh"):
+            self.work_dir = work_dir
+            self.script_path = script_path
+            self.vms = {}  # Track VM state
+            
+            # Ensure directories exist
+            os.makedirs(work_dir, exist_ok=True)
+            os.chdir(work_dir)
+            
+            logger.info(f"Firecracker VM Daemon starting in {work_dir}")
+            logger.info(f"Using script: {script_path}")
+
+        def execute_script(self, args, timeout=300):
+            """Execute firecracker-complete.sh with given arguments"""
+            cmd = [self.script_path] + args
+            logger.info(f"Executing: {' '.join(cmd)}")
+            
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    cwd=self.work_dir
+                )
+                return {
+                    "success": result.returncode == 0,
+                    "returncode": result.returncode,
+                    "stdout": result.stdout,
+                    "stderr": result.stderr
+                }
+            except subprocess.TimeoutExpired:
+                return {
+                    "success": False,
+                    "returncode": -1,
+                    "stdout": "",
+                    "stderr": f"Command timed out after {timeout} seconds"
+                }
+            except Exception as e:
+                return {
+                    "success": False,
+                    "returncode": -1,
+                    "stdout": "",
+                    "stderr": str(e)
+                }
+
+        def create_vm(self, vm_spec):
+            """Create a Firecracker VM using host bridge networking"""
+            vm_id = vm_spec.get("vm_id", f"vm-{int(time.time())}")
+            github_url = vm_spec.get("github_url", "")
+            github_token = vm_spec.get("github_token", "")
+            labels = vm_spec.get("labels", "firecracker")
+            memory = vm_spec.get("memory_mb", 8192)
+            vcpus = vm_spec.get("vcpus", 4)
+            ephemeral = vm_spec.get("ephemeral", True)
+            
+            # Build firecracker-complete.sh launch command
+            args = [
+                "launch",
+                "--name", vm_id,
+                "--github-url", github_url,
+                "--github-token", github_token,
+                "--labels", labels,
+                "--memory", str(memory),
+                "--cpus", str(vcpus),
+                "--use-host-bridge",  # Use host br0 bridge
+                "--arc-mode",
+                "--arc-controller-url", "http://localhost:30080"
+            ]
+            
+            if ephemeral:
+                args.append("--ephemeral-mode")
+            
+            # Execute VM creation
+            result = self.execute_script(args, timeout=600)  # 10 minute timeout
+            
+            if result["success"]:
+                # Track VM
+                self.vms[vm_id] = {
+                    "created": datetime.now().isoformat(),
+                    "status": "running",
+                    "spec": vm_spec,
+                    "networking": "bridge-br0"
+                }
+                logger.info(f"VM {vm_id} created successfully")
+            else:
+                logger.error(f"Failed to create VM {vm_id}: {result['stderr']}")
+            
+            return {
+                "vm_id": vm_id,
+                "success": result["success"],
+                "message": result["stderr"] if not result["success"] else "VM created successfully",
+                "details": result
+            }
+
+        def delete_vm(self, vm_id):
+            """Delete a Firecracker VM"""
+            args = ["stop", vm_id]
+            result = self.execute_script(args)
+            
+            if vm_id in self.vms:
+                self.vms[vm_id]["status"] = "deleted"
+            
+            return {
+                "vm_id": vm_id,
+                "success": result["success"],
+                "message": result["stderr"] if not result["success"] else "VM deleted successfully"
+            }
+
+        def list_vms(self):
+            """List all VMs using firecracker-complete.sh"""
+            result = self.execute_script(["list"])
+            
+            return {
+                "success": result["success"],
+                "vms": self.vms,
+                "host_status": result["stdout"],
+                "details": result
+            }
+
+        def get_vm_status(self, vm_id):
+            """Get status of a specific VM"""
+            args = ["status", vm_id]
+            result = self.execute_script(args)
+            
+            vm_info = self.vms.get(vm_id, {})
+            
+            return {
+                "vm_id": vm_id,
+                "success": result["success"],
+                "status": vm_info.get("status", "unknown"),
+                "details": result["stdout"],
+                "vm_info": vm_info
+            }
+
+    class VMDaemonHandler(BaseHTTPRequestHandler):
+        def __init__(self, daemon, *args, **kwargs):
+            self.daemon = daemon
+            super().__init__(*args, **kwargs)
+
+        def log_message(self, format, *args):
+            # Use our logger instead of default logging
+            logger.info(f"{self.address_string()} - {format % args}")
+
+        def do_GET(self):
+            """Handle GET requests"""
+            parsed = urlparse(self.path)
+            path = parsed.path
+            
+            try:
+                if path == "/health":
+                    self.send_json_response({"status": "healthy", "daemon": "firecracker-vm"})
+                elif path == "/vms":
+                    result = self.daemon.list_vms()
+                    self.send_json_response(result)
+                elif path.startswith("/vms/"):
+                    vm_id = path.split("/")[-1]
+                    result = self.daemon.get_vm_status(vm_id)
+                    self.send_json_response(result)
+                else:
+                    self.send_error(404, "Not Found")
+            except Exception as e:
+                logger.error(f"GET error: {e}")
+                self.send_error(500, str(e))
+
+        def do_POST(self):
+            """Handle POST requests"""
+            parsed = urlparse(self.path)
+            path = parsed.path
+            
+            try:
+                # Read request body
+                content_length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(content_length).decode('utf-8') if content_length > 0 else "{}"
+                data = json.loads(body)
+                
+                if path == "/vms":
+                    # Create VM
+                    result = self.daemon.create_vm(data)
+                    self.send_json_response(result, status_code=201 if result["success"] else 400)
+                else:
+                    self.send_error(404, "Not Found")
+            except json.JSONDecodeError:
+                self.send_error(400, "Invalid JSON")
+            except Exception as e:
+                logger.error(f"POST error: {e}")
+                self.send_error(500, str(e))
+
+        def do_DELETE(self):
+            """Handle DELETE requests"""
+            parsed = urlparse(self.path)
+            path = parsed.path
+            
+            try:
+                if path.startswith("/vms/"):
+                    vm_id = path.split("/")[-1]
+                    result = self.daemon.delete_vm(vm_id)
+                    self.send_json_response(result)
+                else:
+                    self.send_error(404, "Not Found")
+            except Exception as e:
+                logger.error(f"DELETE error: {e}")
+                self.send_error(500, str(e))
+
+        def send_json_response(self, data, status_code=200):
+            """Send JSON response"""
+            response = json.dumps(data, indent=2)
+            self.send_response(status_code)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(response)))
+            self.end_headers()
+            self.wfile.write(response.encode('utf-8'))
+
+    def create_handler(daemon):
+        """Create request handler with daemon instance"""
+        def handler(*args, **kwargs):
+            return VMDaemonHandler(daemon, *args, **kwargs)
+        return handler
+
+    def main():
+        port = int(os.environ.get("DAEMON_PORT", "8090"))
+        work_dir = os.environ.get("FIRECRACKER_WORK_DIR", "/opt/firecracker")
+        script_path = os.environ.get("FIRECRACKER_SCRIPT", "/usr/local/bin/firecracker-complete.sh")
+        
+        # Initialize daemon
+        daemon = FirecrackerVMDaemon(work_dir, script_path)
+        
+        # Create HTTP server
+        handler = create_handler(daemon)
+        server = HTTPServer(('0.0.0.0', port), handler)
+        
+        logger.info(f"Firecracker VM Daemon listening on port {port}")
+        logger.info(f"API endpoints:")
+        logger.info(f"  GET  /health          - Health check")
+        logger.info(f"  GET  /vms             - List all VMs")
+        logger.info(f"  POST /vms             - Create VM")
+        logger.info(f"  GET  /vms/{{vm_id}}     - Get VM status")
+        logger.info(f"  DELETE /vms/{{vm_id}}  - Delete VM")
+        
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            logger.info("Shutting down daemon...")
+            server.shutdown()
+
+    if __name__ == "__main__":
+        main()

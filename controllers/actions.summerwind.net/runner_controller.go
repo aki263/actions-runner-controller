@@ -75,7 +75,7 @@ type RunnerReconciler struct {
 	UnregistrationRetryDelay    time.Duration
 
 	RunnerPodDefaults    RunnerPodDefaults
-	FirecrackerVMManager *FirecrackerVMManager
+	FirecrackerVMManager VMManager
 }
 
 type RunnerPodDefaults struct {
