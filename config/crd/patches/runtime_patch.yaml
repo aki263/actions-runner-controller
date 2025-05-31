@@ -1,0 +1,99 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: runnerdeployments.actions.summerwind.dev
+spec:
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          spec:
+            properties:
+              template:
+                properties:
+                  spec:
+                    properties:
+                      runtime:
+                        description: Runtime configuration for the runner (Firecracker, container, etc.)
+                        properties:
+                          type:
+                            description: Runtime type (firecracker, container)
+                            type: string
+                            default: "container"
+                            enum:
+                            - container
+                            - firecracker
+                          firecracker:
+                            description: Firecracker runtime configuration
+                            properties:
+                              kernelImagePath:
+                                description: Path to the kernel image
+                                type: string
+                              rootfsImagePath:
+                                description: Path to the root filesystem image
+                                type: string
+                              snapshotName:
+                                description: Name of the snapshot to use
+                                type: string
+                              memoryMiB:
+                                description: Memory in MiB
+                                type: integer
+                                default: 2048
+                              vcpus:
+                                description: Number of vCPUs
+                                type: integer
+                                default: 2
+                              networkConfig:
+                                description: Network configuration
+                                properties:
+                                  networkMode:
+                                    description: Network mode (bridge, macvlan, host, nat)
+                                    type: string
+                                    default: "bridge"
+                                    enum:
+                                    - bridge
+                                    - macvlan
+                                    - host
+                                    - nat
+                                  parentInterface:
+                                    description: Parent interface for macvlan/nat
+                                    type: string
+                                  bridgeName:
+                                    description: Bridge name
+                                    type: string
+                                    default: "fc-br0"
+                                  dhcpEnabled:
+                                    description: Enable DHCP
+                                    type: boolean
+                                  interface:
+                                    description: Interface name inside VM
+                                    type: string
+                                    default: "eth0"
+                                  subnetCIDR:
+                                    description: Subnet CIDR
+                                    type: string
+                                    default: "172.16.0.0/24"
+                                  gateway:
+                                    description: Gateway IP
+                                    type: string
+                                    default: "172.16.0.1"
+                                type: object
+                              ephemeralMode:
+                                description: Destroy VM after job completion
+                                type: boolean
+                              useHostBridge:
+                                description: Use host bridge networking
+                                type: boolean
+                              arcMode:
+                                description: Enable ARC integration
+                                type: boolean
+                              arcControllerURL:
+                                description: ARC controller URL
+                                type: string
+                              dockerMode:
+                                description: Run runner directly like container
+                                type: boolean
+                            type: object
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true 

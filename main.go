@@ -284,12 +284,28 @@ func main() {
 			ghClient,
 		)
 
+		// Initialize FirecrackerVMManager if enabled
+		var firecrackerVMManager *actionssummerwindnet.FirecrackerVMManager
+		if os.Getenv("ENABLE_FIRECRACKER") == "true" {
+			arcControllerURL := os.Getenv("ARC_CONTROLLER_URL")
+			if arcControllerURL == "" {
+				arcControllerURL = "http://localhost:30080" // Default
+			}
+			firecrackerVMManager = actionssummerwindnet.NewFirecrackerVMManager(
+				mgr.GetClient(),
+				log.WithName("firecracker-vm-manager"),
+				arcControllerURL,
+			)
+			log.Info("Firecracker VM Manager initialized", "arcControllerURL", arcControllerURL)
+		}
+
 		runnerReconciler := &actionssummerwindnet.RunnerReconciler{
-			Client:            mgr.GetClient(),
-			Log:               log.WithName("runner"),
-			Scheme:            mgr.GetScheme(),
-			GitHubClient:      multiClient,
-			RunnerPodDefaults: runnerPodDefaults,
+			Client:               mgr.GetClient(),
+			Log:                  log.WithName("runner"),
+			Scheme:               mgr.GetScheme(),
+			GitHubClient:         multiClient,
+			RunnerPodDefaults:    runnerPodDefaults,
+			FirecrackerVMManager: firecrackerVMManager,
 		}
 
 		if err = runnerReconciler.SetupWithManager(mgr); err != nil {
