@@ -290,7 +290,8 @@ func main() {
 			// Use host-based DaemonSet API for proper bridge networking
 			daemonAPIURL := os.Getenv("FIRECRACKER_DAEMON_URL")
 			if daemonAPIURL == "" {
-				daemonAPIURL = "http://192.168.21.32:30090" // Default to host node with DaemonSet
+				// Default to localhost with NodePort, can be overridden via env
+				daemonAPIURL = "http://localhost:30090"
 			}
 			
 			hostVMManager := actionssummerwindnet.NewHostFirecrackerVMManager(

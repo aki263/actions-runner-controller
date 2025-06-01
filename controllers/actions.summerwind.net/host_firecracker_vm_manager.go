@@ -1,10 +1,11 @@
-package actionssummerwinded
+package actionssummerwindnet
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"time"
@@ -26,6 +27,11 @@ type VMManagerAdapter struct {
 	Log         logr.Logger
 }
 
+const (
+	// Annotation to store the VM ID for this runner
+	AnnotationVMID = "firecracker.arc/vm-id"
+)
+
 // CreateVM adapts the host manager call to the expected interface
 func (a *VMManagerAdapter) CreateVM(ctx context.Context, runner *v1alpha1.Runner, registrationToken string) (*VMInfo, error) {
 	if runner.Spec.Runtime == nil || runner.Spec.Runtime.Firecracker == nil {
@@ -35,19 +41,61 @@ func (a *VMManagerAdapter) CreateVM(ctx context.Context, runner *v1alpha1.Runner
 	fcConfig := runner.Spec.Runtime.Firecracker
 	githubURL := getGitHubURLFromRunner(runner)
 	
-	return a.HostManager.CreateVM(ctx, runner.Name, fcConfig, registrationToken, githubURL)
+	// Generate a deterministic VM ID and store it in annotations
+	vmID := generateDeterministicVMID(runner.Name)
+	
+	// Call the host manager with the VM ID
+	vmInfo, err := a.HostManager.CreateVM(ctx, runner.Name, vmID, fcConfig, registrationToken, githubURL)
+	if err != nil {
+		return nil, err
+	}
+	
+	// Store the VM ID in runner annotations for future reference
+	// Note: This should be done by the caller (runner controller) to avoid circular dependencies
+	a.Log.Info("VM created with ID", "vmID", vmID, "runner", runner.Name)
+	
+	return vmInfo, nil
 }
 
 // DeleteVM adapts the host manager call to the expected interface
 func (a *VMManagerAdapter) DeleteVM(ctx context.Context, runner *v1alpha1.Runner) error {
-	vmID := generateVMIDFromRunner(runner.Name)
+	vmID := getVMIDFromRunner(runner)
 	return a.HostManager.DeleteVM(ctx, vmID)
 }
 
 // GetVMStatus adapts the host manager call to the expected interface
 func (a *VMManagerAdapter) GetVMStatus(ctx context.Context, runner *v1alpha1.Runner) (*VMInfo, error) {
-	vmID := generateVMIDFromRunner(runner.Name)
+	vmID := getVMIDFromRunner(runner)
 	return a.HostManager.GetVMStatus(ctx, vmID)
+}
+
+// getVMIDFromRunner gets the VM ID from runner annotations or generates a deterministic one
+func getVMIDFromRunner(runner *v1alpha1.Runner) string {
+	// First try to get stored VM ID from annotations
+	if runner.Annotations != nil {
+		if vmID, exists := runner.Annotations[AnnotationVMID]; exists && vmID != "" {
+			return vmID
+		}
+	}
+	
+	// Fallback to deterministic generation
+	return generateDeterministicVMID(runner.Name)
+}
+
+// generateDeterministicVMID creates a deterministic VM ID from runner name
+func generateDeterministicVMID(runnerName string) string {
+	// Use a hash of the runner name to make it deterministic but unique
+	h := fnv.New32a()
+	h.Write([]byte(runnerName))
+	hashValue := h.Sum32()
+	
+	// Extract meaningful part and add hash for uniqueness
+	prefix := runnerName
+	if len(prefix) > 20 {
+		prefix = prefix[:20]
+	}
+	
+	return fmt.Sprintf("%s-%d", prefix, hashValue)
 }
 
 // getGitHubURLFromRunner extracts GitHub URL from runner spec
@@ -113,15 +161,12 @@ func NewHostFirecrackerVMManager(log logr.Logger, daemonURL string) *HostFirecra
 }
 
 // CreateVM creates a Firecracker VM via the host daemon API
-func (m *HostFirecrackerVMManager) CreateVM(ctx context.Context, runnerName string, fcConfig *v1alpha1.FirecrackerRuntime, registrationToken, githubURL string) (*VMInfo, error) {
+func (m *HostFirecrackerVMManager) CreateVM(ctx context.Context, runnerName string, vmID string, fcConfig *v1alpha1.FirecrackerRuntime, registrationToken, githubURL string) (*VMInfo, error) {
 	m.Log.Info("Creating Firecracker VM via host daemon", 
 		"runner", runnerName,
 		"githubURL", githubURL,
 		"daemonURL", m.DaemonAPIURL)
 
-	// Generate VM ID from runner name
-	vmID := generateVMIDFromRunner(runnerName)
-	
 	// Build VM specification
 	vmSpec := VMSpec{
 		VMID:        vmID,
@@ -174,16 +219,20 @@ func (m *HostFirecrackerVMManager) CreateVM(ctx context.Context, runnerName stri
 		"vmID", vmResponse.VMID,
 		"message", vmResponse.Message)
 	
-	// Return VM info
+	// Return VM info using existing VMInfo struct fields
 	return &VMInfo{
+		Name:       runnerName,
 		VMID:       vmResponse.VMID,
-		RunnerName: runnerName,
-		Status:     "running",
 		IP:         "dhcp", // Will be assigned by host bridge DHCP
 		Networking: "host-bridge-br0",
 		Bridge:     "br0",
 		TAP:        fmt.Sprintf("tap-%s", vmID[:8]),
-		CreatedAt:  time.Now(),
+		Created:    time.Now(),
+		MemoryMB:   vmSpec.MemoryMB,
+		VCPUs:      vmSpec.VCPUs,
+		GitHubURL:  vmSpec.GitHubURL,
+		Labels:     vmSpec.Labels,
+		EphemeralMode: vmSpec.Ephemeral,
 	}, nil
 }
 
@@ -221,8 +270,10 @@ func (m *HostFirecrackerVMManager) DeleteVM(ctx context.Context, vmID string) er
 	return nil
 }
 
-// GetVMStatus gets the status of a VM via the host daemon API
+// GetVMStatus gets the status of a Firecracker VM via the host daemon API
 func (m *HostFirecrackerVMManager) GetVMStatus(ctx context.Context, vmID string) (*VMInfo, error) {
+	m.Log.Info("Getting Firecracker VM status via host daemon", "vmID", vmID)
+	
 	url := fmt.Sprintf("%s/vms/%s", m.DaemonAPIURL, vmID)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -231,32 +282,32 @@ func (m *HostFirecrackerVMManager) GetVMStatus(ctx context.Context, vmID string)
 	
 	resp, err := m.HTTPClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to call daemon status API: %w", err)
+		return nil, fmt.Errorf("failed to call daemon API: %w", err)
 	}
 	defer resp.Body.Close()
 	
-	if resp.StatusCode == 404 {
-		return nil, fmt.Errorf("VM not found: %s", vmID)
-	}
-	
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read status response: %w", err)
+		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 	
 	var vmResponse VMResponse
 	if err := json.Unmarshal(body, &vmResponse); err != nil {
-		return nil, fmt.Errorf("failed to parse status response: %w", err)
+		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 	
-	// Convert to VMInfo
+	if !vmResponse.Success {
+		return nil, fmt.Errorf("daemon failed to get VM status: %s", vmResponse.Message)
+	}
+	
+	// Convert to VMInfo using existing struct fields
 	return &VMInfo{
 		VMID:       vmID,
-		Status:     "running", // Simplified for now
 		IP:         "dhcp",
 		Networking: "host-bridge-br0",
 		Bridge:     "br0",
-		CreatedAt:  time.Now(), // Would need to parse from response
+		TAP:        fmt.Sprintf("tap-%s", vmID[:8]),
+		Created:    time.Now(), // We don't have exact creation time from daemon
 	}, nil
 }
 
@@ -289,7 +340,6 @@ func (m *HostFirecrackerVMManager) ListVMs(ctx context.Context) ([]VMInfo, error
 	for vmID := range listResponse.VMs {
 		vms = append(vms, VMInfo{
 			VMID:       vmID,
-			Status:     "running",
 			IP:         "dhcp",
 			Networking: "host-bridge-br0",
 			Bridge:     "br0",
@@ -319,15 +369,4 @@ func (m *HostFirecrackerVMManager) CheckDaemonHealth(ctx context.Context) error 
 	}
 	
 	return nil
-}
-
-// generateVMIDFromRunner creates a VM ID from runner name
-func generateVMIDFromRunner(runnerName string) string {
-	// Extract meaningful part and add timestamp for uniqueness
-	if len(runnerName) > 20 {
-		runnerName = runnerName[:20]
-	}
-	
-	timestamp := time.Now().Unix()
-	return fmt.Sprintf("%s-%d", runnerName, timestamp)
 } 

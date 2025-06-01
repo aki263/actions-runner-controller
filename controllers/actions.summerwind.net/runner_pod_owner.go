@@ -332,37 +332,59 @@ func syncRunnerPodsOwners(ctx context.Context, c client.Client, log logr.Logger,
 
 	maybeRunning := pending + running
 
+	// Special handling for Firecracker VMs to prevent race condition
+	// Check if we have Firecracker runners in "Creating" state
+	var firecrackerCreating int
+	for _, obj := range owners {
+		if runner, ok := obj.(*v1alpha1.Runner); ok {
+			if runner.Spec.Runtime != nil && runner.Spec.Runtime.Type == "firecracker" {
+				if runner.Status.Phase == "Creating" {
+					firecrackerCreating++
+				}
+			}
+		}
+	}
+
+	// For Firecracker VMs, include "Creating" state as potentially running
+	// to prevent race condition where controllers create many runners while VMs are starting
+	if firecrackerCreating > 0 {
+		log.V(1).Info("Found Firecracker VMs in Creating state, including them in count to prevent race condition",
+			"firecrackerCreating", firecrackerCreating)
+		maybeRunning += firecrackerCreating
+	}
+
 	wantMoreRunners := newDesiredReplicas > maybeRunning
 	alreadySyncedAfterEffectiveTime := ephemeral && lastSyncTime != nil && effectiveTime != nil && lastSyncTime.After(effectiveTime.Time)
 	runnerPodRecreationDelayAfterWebhookScale := lastSyncTime != nil && time.Now().Before(lastSyncTime.Add(DefaultRunnerPodRecreationDelayAfterWebhookScale))
 
-	log = log.WithValues(
-		"lastSyncTime", lastSyncTime,
-		"effectiveTime", effectiveTime,
-		"templateHashDesired", desiredTemplateHash,
-		"replicasDesired", newDesiredReplicas,
-		"replicasPending", pending,
-		"replicasRunning", running,
-		"replicasMaybeRunning", maybeRunning,
-		"templateHashObserved", hashes,
-	)
+	// For Firecracker VMs, implement a 30-second delay before creating new runners
+	// to give existing "Creating" VMs time to start
+	const FirecrackerVMStartupDelay = 30 * time.Second
+	firecrackerStartupDelay := false
+	if firecrackerCreating > 0 && lastSyncTime != nil {
+		firecrackerStartupDelay = time.Now().Before(lastSyncTime.Add(FirecrackerVMStartupDelay))
+		if firecrackerStartupDelay {
+			log.V(1).Info("Delaying creation of new Firecracker VMs to allow existing ones to start",
+				"firecrackerCreating", firecrackerCreating,
+				"delayRemaining", time.Until(lastSyncTime.Add(FirecrackerVMStartupDelay)))
+		}
+	}
 
-	if wantMoreRunners && alreadySyncedAfterEffectiveTime && runnerPodRecreationDelayAfterWebhookScale {
-		// This is our special handling of the situation for ephemeral runners only.
-		//
-		// Handling static runners this way results in scale-up to not work at all,
-		// because then any scale up attempts for static runenrs fall within this condition, for two reasons.
-		// First, static(persistent) runners will never restart on their own.
-		// Second, we don't update EffectiveTime for static runners.
-		//
-		// We do need to skip this condition for static runners, and that's why we take the `ephemeral` flag into account when
-		// computing `alreadySyncedAfterEffectiveTime``.
+	log.V(1).Info("Replica calculation for Firecracker",
+		"total", total,
+		"running", running,
+		"pending", pending,
+		"firecrackerCreating", firecrackerCreating,
+		"maybeRunning", maybeRunning,
+		"desired", newDesiredReplicas,
+		"wantMoreRunners", wantMoreRunners,
+		"firecrackerStartupDelay", firecrackerStartupDelay)
 
-		log.V(2).Info(
-			"Detected that some ephemeral runners have disappeared. " +
-				"Usually this is due to that ephemeral runner completions " +
-				"so ARC does not create new runners until EffectiveTime is updated, or DefaultRunnerPodRecreationDelayAfterWebhookScale is elapsed.")
-	} else if wantMoreRunners {
+	if !alreadySyncedAfterEffectiveTime && runnerPodRecreationDelayAfterWebhookScale {
+		log.V(2).Info("Skipping scale up because DefaultRunnerPodRecreationDelayAfterWebhookScale has not been passed yet")
+
+		return nil, nil
+	} else if wantMoreRunners && !firecrackerStartupDelay {
 		if alreadySyncedAfterEffectiveTime && !runnerPodRecreationDelayAfterWebhookScale {
 			log.V(2).Info("Adding more replicas because DefaultRunnerPodRecreationDelayAfterWebhookScale has been passed")
 		}

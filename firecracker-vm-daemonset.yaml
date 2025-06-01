@@ -27,7 +27,8 @@ spec:
         effect: NoExecute
       nodeSelector:
         # Only run on nodes that have Firecracker support
-        kubernetes.io/hostname: tenki-staging-runner-2
+        # Update this label to match your target nodes
+        arc.actions/firecracker-capable: "true"
       containers:
       - name: vm-daemon
         image: python:3.11-slim
@@ -36,18 +37,39 @@ spec:
         - /bin/bash
         - -c
         - |
+          set -e
+          echo "Starting Firecracker VM Daemon initialization..."
+          
           # Install required packages
-          apt-get update && apt-get install -y curl wget jq openssh-client genisoimage
+          apt-get update && apt-get install -y \
+            curl wget jq openssh-client genisoimage \
+            iproute2 iptables bridge-utils
           
           # Install Firecracker (if not already available on host)
           if ! command -v firecracker &> /dev/null; then
+            echo "Installing Firecracker..."
             wget -q https://github.com/firecracker-microvm/firecracker/releases/download/v1.12.0/firecracker-v1.12.0-x86_64.tgz
             tar -xzf firecracker-v1.12.0-x86_64.tgz
             cp release-v1.12.0-x86_64/firecracker-v1.12.0-x86_64 /usr/local/bin/firecracker
             chmod +x /usr/local/bin/firecracker
+            echo "Firecracker installed successfully"
+          else
+            echo "Firecracker already available"
           fi
           
-          # Start the VM daemon
+          # Verify required devices exist
+          echo "Checking required devices..."
+          if [[ ! -e /dev/kvm ]]; then
+            echo "ERROR: /dev/kvm not found. KVM is required for Firecracker."
+            exit 1
+          fi
+          
+          if [[ ! -e /dev/net/tun ]]; then
+            echo "ERROR: /dev/net/tun not found. TUN/TAP support is required."
+            exit 1
+          fi
+          
+          echo "Starting Firecracker VM Daemon..."
           exec python3 /app/firecracker-vm-daemon.py
         ports:
         - name: http-api

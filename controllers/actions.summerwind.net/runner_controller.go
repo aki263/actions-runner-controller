@@ -60,6 +60,12 @@ const (
 	EnvVarEnterprise = "RUNNER_ENTERPRISE"
 	EnvVarEphemeral  = "RUNNER_EPHEMERAL"
 	EnvVarTrue       = "true"
+	
+	// Firecracker VM creation lock annotation
+	AnnotationVMCreating = "firecracker.arc/creating-vm"
+	
+	// VM creation timeout - how long to wait before assuming creation failed
+	VMCreationTimeout = 5 * time.Minute
 )
 
 // RunnerReconciler reconciles a Runner object
@@ -162,11 +168,84 @@ func (r *RunnerReconciler) handleFirecrackerRunnerStatus(ctx context.Context, ru
 		return r.processRunnerCreation(ctx, runner, log)
 	}
 
+	// Check if VM creation is already in progress
+	if creatingAnnotation, exists := runner.Annotations[AnnotationVMCreating]; exists {
+		// Parse creation timestamp
+		if creationTime, err := time.Parse(time.RFC3339, creatingAnnotation); err == nil {
+			// If creation started more than 5 minutes ago, assume it failed and retry
+			if time.Since(creationTime) > VMCreationTimeout {
+				log.Info("VM creation timed out, removing creation lock and retrying", 
+					"creationStarted", creationTime, "elapsed", time.Since(creationTime))
+				
+				// Remove the creating annotation to allow retry
+				updated := runner.DeepCopy()
+				if updated.Annotations == nil {
+					updated.Annotations = make(map[string]string)
+				}
+				delete(updated.Annotations, AnnotationVMCreating)
+				
+				if err := r.Update(ctx, updated); err != nil {
+					log.Error(err, "Failed to remove creation lock annotation")
+					return ctrl.Result{RequeueAfter: time.Minute}, err
+				}
+				
+				// Proceed with creation after removing lock
+			} else {
+				// Creation is in progress and hasn't timed out yet
+				log.V(1).Info("VM creation in progress, waiting", 
+					"creationStarted", creationTime, "elapsed", time.Since(creationTime))
+				
+				// Update status to show creation in progress
+				if runner.Status.Phase != "Creating" {
+					updated := runner.DeepCopy()
+					updated.Status.Phase = "Creating"
+					updated.Status.Ready = false
+					updated.Status.Reason = "VMCreating"
+					updated.Status.Message = fmt.Sprintf("Firecracker VM creation in progress (started %v ago)", time.Since(creationTime).Truncate(time.Second))
+
+					if err := r.Status().Patch(ctx, updated, client.MergeFrom(&runner)); err != nil {
+						log.Error(err, "Failed to update creating status")
+					}
+				}
+				
+				// Requeue to check again soon
+				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+			}
+		} else {
+			log.Error(err, "Failed to parse creation timestamp, removing invalid annotation")
+			// Remove invalid annotation
+			updated := runner.DeepCopy()
+			if updated.Annotations == nil {
+				updated.Annotations = make(map[string]string)
+			}
+			delete(updated.Annotations, AnnotationVMCreating)
+			
+			if err := r.Update(ctx, updated); err != nil {
+				log.Error(err, "Failed to remove invalid creation annotation")
+				return ctrl.Result{RequeueAfter: time.Minute}, err
+			}
+		}
+	}
+
 	vmInfo, err := r.FirecrackerVMManager.GetVMStatus(ctx, &runner)
 	if err != nil {
-		// VM doesn't exist yet, create it
+		// VM doesn't exist yet, create it (with creation lock)
 		log.V(1).Info("VM not found, creating", "error", err)
-		return r.processRunnerCreation(ctx, runner, log)
+		return r.processRunnerCreationWithLock(ctx, runner, log)
+	}
+
+	// VM exists - remove any creation lock and update status
+	if _, exists := runner.Annotations[AnnotationVMCreating]; exists {
+		updated := runner.DeepCopy()
+		if updated.Annotations == nil {
+			updated.Annotations = make(map[string]string)
+		}
+		delete(updated.Annotations, AnnotationVMCreating)
+		
+		if err := r.Update(ctx, updated); err != nil {
+			log.Error(err, "Failed to remove creation lock after VM found")
+			// Continue with status update anyway
+		}
 	}
 
 	// Determine VM status
@@ -206,6 +285,26 @@ func (r *RunnerReconciler) handleFirecrackerRunnerStatus(ctx context.Context, ru
 
 	// Requeue to check VM status periodically
 	return ctrl.Result{RequeueAfter: time.Minute}, nil
+}
+
+// processRunnerCreationWithLock handles VM creation with a creation lock to prevent race conditions
+func (r *RunnerReconciler) processRunnerCreationWithLock(ctx context.Context, runner v1alpha1.Runner, log logr.Logger) (ctrl.Result, error) {
+	// Set creation lock annotation to prevent concurrent creation attempts
+	updated := runner.DeepCopy()
+	if updated.Annotations == nil {
+		updated.Annotations = make(map[string]string)
+	}
+	updated.Annotations[AnnotationVMCreating] = time.Now().Format(time.RFC3339)
+	
+	if err := r.Update(ctx, updated); err != nil {
+		log.Error(err, "Failed to set creation lock annotation")
+		return ctrl.Result{RequeueAfter: time.Minute}, err
+	}
+	
+	log.Info("Set VM creation lock, proceeding with creation")
+	
+	// Directly call Firecracker VM creation, bypassing status handler
+	return r.processFirecrackerRunnerCreation(ctx, *updated, log)
 }
 
 func (r *RunnerReconciler) handleContainerRunnerStatus(ctx context.Context, runner v1alpha1.Runner, log logr.Logger) (ctrl.Result, error) {
@@ -392,6 +491,10 @@ func (r *RunnerReconciler) processRunnerCreation(ctx context.Context, runner v1a
 func (r *RunnerReconciler) processFirecrackerRunnerCreation(ctx context.Context, runner v1alpha1.Runner, log logr.Logger) (reconcile.Result, error) {
 	if r.FirecrackerVMManager == nil {
 		log.Error(fmt.Errorf("Firecracker VM manager not configured"), "Cannot create Firecracker runner")
+		
+		// Clean up creation lock on permanent failure
+		r.cleanupCreationLock(ctx, runner, log)
+		
 		return ctrl.Result{}, fmt.Errorf("Firecracker VM manager not configured")
 	}
 
@@ -399,6 +502,7 @@ func (r *RunnerReconciler) processFirecrackerRunnerCreation(ctx context.Context,
 	registrationToken := runner.Status.Registration.Token
 	if registrationToken == "" {
 		log.Error(fmt.Errorf("registration token missing"), "Cannot create Firecracker VM without registration token")
+		// Don't clean up lock here, token might become available later
 		return ctrl.Result{RequeueAfter: time.Second * 30}, nil
 	}
 
@@ -409,13 +513,50 @@ func (r *RunnerReconciler) processFirecrackerRunnerCreation(ctx context.Context,
 	if err != nil {
 		log.Error(err, "Failed to create Firecracker VM")
 		r.Recorder.Event(&runner, corev1.EventTypeWarning, "VMCreationFailed", fmt.Sprintf("Failed to create Firecracker VM: %v", err))
+		
+		// Clean up creation lock on failure
+		r.cleanupCreationLock(ctx, runner, log)
+		
 		return ctrl.Result{RequeueAfter: time.Minute}, err
+	}
+
+	// Store the VM ID in runner annotations for future reference
+	updated := runner.DeepCopy()
+	if updated.Annotations == nil {
+		updated.Annotations = make(map[string]string)
+	}
+	updated.Annotations["firecracker.arc/vm-id"] = vmInfo.VMID
+	
+	if err := r.Update(ctx, updated); err != nil {
+		log.Error(err, "Failed to store VM ID in runner annotations")
+		// Continue anyway, the VM was created successfully
+	} else {
+		log.Info("Stored VM ID in runner annotations", "vmID", vmInfo.VMID)
 	}
 
 	r.Recorder.Event(&runner, corev1.EventTypeNormal, "VMCreated", fmt.Sprintf("Created Firecracker VM '%s' with IP %s", vmInfo.VMID, vmInfo.IP))
 	log.Info("Created Firecracker VM", "vmID", vmInfo.VMID, "ip", vmInfo.IP, "pid", vmInfo.PID)
 
 	return ctrl.Result{}, nil
+}
+
+// cleanupCreationLock removes the VM creation lock annotation
+func (r *RunnerReconciler) cleanupCreationLock(ctx context.Context, runner v1alpha1.Runner, log logr.Logger) {
+	if _, exists := runner.Annotations[AnnotationVMCreating]; !exists {
+		return // No lock to clean up
+	}
+	
+	updated := runner.DeepCopy()
+	if updated.Annotations == nil {
+		updated.Annotations = make(map[string]string)
+	}
+	delete(updated.Annotations, AnnotationVMCreating)
+	
+	if err := r.Update(ctx, updated); err != nil {
+		log.Error(err, "Failed to clean up creation lock annotation")
+	} else {
+		log.V(1).Info("Cleaned up VM creation lock")
+	}
 }
 
 func (r *RunnerReconciler) processContainerRunnerCreation(ctx context.Context, runner v1alpha1.Runner, log logr.Logger) (reconcile.Result, error) {
