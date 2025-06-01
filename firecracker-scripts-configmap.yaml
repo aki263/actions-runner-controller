@@ -63,7 +63,9 @@ data:
     # Create TAP interface for VM
     create_tap_interface() {
         local vm_name="$1"
-        local tap_name="tap-${vm_name}"
+        # Truncate vm_name to ensure tap name is <= 15 chars (tap- is 4 chars, so vm_name max 11)
+        local truncated_name="${vm_name:0:11}"
+        local tap_name="tap-${truncated_name}"
         
         if ! ip link show "$tap_name" >/dev/null 2>&1; then
             log "Creating TAP interface: $tap_name"
@@ -116,7 +118,7 @@ data:
       "machine-config": {
         "vcpu_count": $vcpus,
         "mem_size_mib": $memory_mb,
-        "ht_enabled": false
+        "smt": false
       },
       "network-interfaces": [
         {
