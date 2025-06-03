@@ -1,0 +1,149 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  labels:
+    app: firecracker-daemon
+  name: firecracker-vm-daemon
+  namespace: arc-systems
+spec:
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: firecracker-daemon
+  template:
+    metadata:
+      labels:
+        app: firecracker-daemon
+    spec:
+      containers:
+      - command:
+        - /bin/bash
+        - -c
+        - |
+          set -euo pipefail
+          echo "=== Starting service monitor ==="
+          
+          while true; do
+            # Check if host service is running
+            if chroot /host systemctl is-active --quiet firecracker-agent; then
+              echo "Host service is running"
+              # Test HTTP endpoint on the correct port (8091)
+              if curl -s http://localhost:8091/health > /dev/null 2>&1; then
+                echo "HTTP endpoint is healthy"
+              else
+                echo "HTTP endpoint not responding, restarting service..."
+                chroot /host systemctl restart firecracker-agent
+              fi
+            else
+              echo "Host service is not running, starting..."
+              chroot /host systemctl start firecracker-agent
+            fi
+            
+            sleep 30
+          done
+        image: us-west1-docker.pkg.dev/tenki-cloud/tenki-runners-prod/arc-aakash-fc-ds:v1.6.2
+        livenessProbe:
+          exec:
+            command:
+            - /bin/bash
+            - -c
+            - curl -f http://localhost:8091/health
+          failureThreshold: 3
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+        name: service-monitor
+        ports:
+        - containerPort: 8091
+          hostPort: 8091
+          protocol: TCP
+        readinessProbe:
+          exec:
+            command:
+            - /bin/bash
+            - -c
+            - curl -f http://localhost:8091/health
+          failureThreshold: 3
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+        resources:
+          limits:
+            cpu: 100m
+            memory: 128Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - mountPath: /host
+          name: host-root
+      dnsPolicy: ClusterFirst
+      hostIPC: true
+      hostNetwork: true
+      hostPID: true
+      imagePullSecrets:
+      - name: tenki-regcred
+      initContainers:
+      - command:
+        - /bin/bash
+        - -c
+        - |
+          set -euo pipefail
+          echo "=== Installing Firecracker VM Agent on Host ==="
+          
+          # Copy the improved installation script to /tmp on host
+          cp /app/host-install-improved.sh /host/tmp/host-install-improved.sh
+          chmod +x /host/tmp/host-install-improved.sh
+          
+          # Copy firecracker-complete.sh to /tmp on host  
+          cp /app/firecracker-complete.sh /host/tmp/firecracker-complete.sh
+          chmod +x /host/tmp/firecracker-complete.sh
+          
+          echo "Running improved host installation script..."
+          chroot /host /bin/bash -c "cd /tmp && ./host-install-improved.sh"
+          
+          echo "=== Host installation complete ==="
+        image: us-west1-docker.pkg.dev/tenki-cloud/tenki-runners-prod/arc-aakash-fc-ds:v1.6.2
+        name: host-installer
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - mountPath: /host
+          name: host-root
+        - mountPath: /app/host-install-improved.sh
+          name: firecracker-host-install-v2
+          subPath: host-install-improved.sh
+        - mountPath: /app/firecracker-complete.sh
+          name: firecracker-scripts
+          subPath: firecracker-complete.sh
+      nodeSelector:
+        kubernetes.io/hostname: tenki-staging-runner-2
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext:
+        fsGroup: 0
+        runAsGroup: 0
+        runAsUser: 0
+      terminationGracePeriodSeconds: 30
+      tolerations:
+      - operator: Exists
+      volumes:
+      - hostPath:
+          path: /
+          type: Directory
+        name: host-root
+      - configMap:
+          defaultMode: 493
+          name: firecracker-host-install-v2
+        name: firecracker-host-install-v2
+      - configMap:
+          defaultMode: 493
+          name: firecracker-scripts
+        name: firecracker-scripts
+  updateStrategy:
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+    type: RollingUpdate 

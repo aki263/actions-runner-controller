@@ -1,0 +1,167 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: firecracker-vm-daemon
+  namespace: arc-systems
+  labels:
+    app: firecracker-daemon
+spec:
+  selector:
+    matchLabels:
+      app: firecracker-daemon
+  template:
+    metadata:
+      labels:
+        app: firecracker-daemon
+    spec:
+      hostNetwork: true
+      hostPID: true
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+        fsGroup: 0
+      imagePullSecrets:
+      - name: tenki-regcred
+      containers:
+      - name: vm-daemon
+        image: us-west1-docker.pkg.dev/tenki-cloud/tenki-runners-prod/arc-aakash-fc-ds:v1.0.1
+        imagePullPolicy: Always
+        command: ["/app/start-daemon.sh"]
+        securityContext:
+          privileged: true
+          capabilities:
+            add:
+            - SYS_ADMIN
+            - NET_ADMIN
+            - SYS_RESOURCE
+            - SYS_PTRACE
+            - MKNOD
+        ports:
+        - containerPort: 8090
+          hostPort: 8090
+          protocol: TCP
+        env:
+        - name: FIRECRACKER_WORK_DIR
+          value: "/opt/firecracker"
+        - name: FIRECRACKER_SCRIPT
+          value: "/app/firecracker-complete.sh"
+        - name: DAEMON_PORT
+          value: "8090"
+        - name: DAEMON_IPS
+          value: "199.180.135.32,192.168.21.32,0.0.0.0"
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        volumeMounts:
+        - name: firecracker-scripts
+          mountPath: /app/firecracker-complete.sh
+          subPath: firecracker-complete.sh
+        - name: firecracker-scripts
+          mountPath: /app/firecracker-vm-daemon.py
+          subPath: firecracker-vm-daemon.py
+        - name: host-opt-firecracker
+          mountPath: /host/opt/firecracker
+        - name: dev
+          mountPath: /dev
+        - name: sys
+          mountPath: /sys
+        - name: proc
+          mountPath: /proc
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8090
+            host: 192.168.21.32
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8090
+            host: 192.168.21.32
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 10
+          successThreshold: 1
+          failureThreshold: 3
+      volumes:
+      - name: firecracker-scripts
+        configMap:
+          name: firecracker-scripts
+          defaultMode: 0755
+      - name: host-opt-firecracker
+        hostPath:
+          path: /opt/firecracker
+          type: DirectoryOrCreate
+      - name: dev
+        hostPath:
+          path: /dev
+      - name: sys
+        hostPath:
+          path: /sys
+      - name: proc
+        hostPath:
+          path: /proc
+      nodeSelector:
+        kubernetes.io/hostname: tenki-staging-runner-2
+      tolerations:
+      - operator: Exists
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: firecracker-vm-daemon
+  namespace: arc-systems
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: firecracker-vm-daemon
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "create", "delete"]
+- apiGroups: ["apps"]
+  resources: ["daemonsets"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: firecracker-vm-daemon
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: firecracker-vm-daemon
+subjects:
+- kind: ServiceAccount
+  name: firecracker-vm-daemon
+  namespace: arc-systems
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: firecracker-vm-daemon
+  namespace: arc-systems
+  labels:
+    app: firecracker-vm-daemon
+spec:
+  type: NodePort
+  selector:
+    app: firecracker-daemon
+  ports:
+  - name: http-api
+    port: 8090
+    targetPort: 8090
+    nodePort: 30090
+    protocol: TCP 

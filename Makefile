@@ -74,9 +74,11 @@ help:
 	@echo "  docker-build                     - Build standard Docker image"
 	@echo "  docker-build-firecracker         - Build Firecracker-enabled Docker image"
 	@echo "  docker-build-firecracker-optimized - Build optimized Firecracker Docker image"
+	@echo "  docker-build-firecracker-ds      - Build Firecracker DaemonSet image (pre-installed deps)"
 	@echo "  docker-buildx                    - Build multi-arch standard image"
 	@echo "  docker-buildx-firecracker        - Build multi-arch Firecracker image"
 	@echo "  docker-buildx-firecracker-optimized - Build multi-arch optimized Firecracker image"
+	@echo "  docker-buildx-firecracker-ds     - Build multi-arch Firecracker DaemonSet image"
 	@echo ""
 	@echo "Push targets:"
 	@echo "  docker-push                      - Push standard Docker images"
@@ -272,6 +274,16 @@ docker-build-firecracker-optimized:
 		-f Dockerfile.firecracker \
 		.
 
+# Build Firecracker DaemonSet Docker image with pre-installed dependencies
+docker-build-firecracker-ds:
+	docker build \
+		--build-arg VERSION=${VERSION} \
+		--build-arg COMMIT_SHA=${COMMIT_SHA} \
+		-t "${DOCKER_IMAGE_NAME}:${VERSION}" \
+		-t "${DOCKER_IMAGE_NAME}:latest" \
+		-f fc-ds.dockerimage \
+		.
+
 # Build multi-arch Firecracker image using buildx
 docker-buildx-firecracker:
 	export DOCKER_CLI_EXPERIMENTAL=enabled ;\
@@ -286,6 +298,21 @@ docker-buildx-firecracker:
 		-t "${DOCKER_IMAGE_NAME}:${VERSION}-firecracker" \
 		-t "${DOCKER_IMAGE_NAME}:firecracker-latest" \
 		-f Dockerfile \
+		. ${PUSH_ARG}
+
+# Build multi-arch Firecracker DaemonSet image using buildx
+docker-buildx-firecracker-ds:
+	export DOCKER_CLI_EXPERIMENTAL=enabled ;\
+	export DOCKER_BUILDKIT=1
+	@if ! docker buildx ls | grep -q container-builder; then\
+		docker buildx create --platform ${PLATFORMS} --name container-builder --use;\
+	fi
+	docker buildx build --platform ${PLATFORMS} \
+		--build-arg VERSION=${VERSION} \
+		--build-arg COMMIT_SHA=${COMMIT_SHA} \
+		-t "${DOCKER_IMAGE_NAME}:${VERSION}" \
+		-t "${DOCKER_IMAGE_NAME}:latest" \
+		-f fc-ds.dockerimage \
 		. ${PUSH_ARG}
 
 # Build optimized multi-arch Firecracker image using buildx

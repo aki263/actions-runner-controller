@@ -1,0 +1,120 @@
+# Production Deployment Strategy for 50+ Nodes
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: firecracker-system
+---
+# ConfigMap with the installation script and firecracker-complete.sh
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: firecracker-installer
+  namespace: firecracker-system
+data:
+  install.sh: |
+    # The improved installation script goes here
+    # (Contents of host-install-improved.sh)
+  firecracker-complete.sh: |
+    # The firecracker management script goes here
+    # (Contents of firecracker-complete.sh)
+---
+# DaemonSet that installs the agent on each node
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: firecracker-installer
+  namespace: firecracker-system
+  labels:
+    app: firecracker-installer
+spec:
+  selector:
+    matchLabels:
+      app: firecracker-installer
+  template:
+    metadata:
+      labels:
+        app: firecracker-installer
+    spec:
+      hostNetwork: true
+      hostPID: true
+      hostIPC: true
+      containers:
+      - name: installer
+        image: ubuntu:24.04
+        command:
+        - /bin/bash
+        - -c
+        - |
+          # Copy scripts to host
+          cp /scripts/install.sh /host-tmp/
+          cp /scripts/firecracker-complete.sh /host-tmp/
+          chmod +x /host-tmp/install.sh
+          
+          # Check if already installed
+          if chroot /host systemctl is-active --quiet firecracker-agent; then
+            echo "Firecracker agent already running, checking for updates..."
+            
+            # Compare script versions and update if needed
+            if ! chroot /host diff -q /opt/firecracker/firecracker-complete.sh /host-tmp/firecracker-complete.sh >/dev/null 2>&1; then
+              echo "Updating firecracker-complete.sh..."
+              chroot /host cp /host-tmp/firecracker-complete.sh /opt/firecracker/
+              chroot /host systemctl restart firecracker-agent
+            fi
+          else
+            echo "Installing Firecracker agent on $(chroot /host hostname)..."
+            chroot /host /host-tmp/install.sh
+          fi
+          
+          # Keep container running to maintain DaemonSet
+          echo "Installation complete, monitoring..."
+          while true; do
+            sleep 300
+            # Health check
+            if ! chroot /host systemctl is-active --quiet firecracker-agent; then
+              echo "Agent down, restarting..."
+              chroot /host systemctl start firecracker-agent
+            fi
+          done
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: host-root
+          mountPath: /host
+        - name: host-tmp
+          mountPath: /host-tmp
+        - name: scripts
+          mountPath: /scripts
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+      tolerations:
+      - operator: Exists  # Run on all nodes including master
+      volumes:
+      - name: host-root
+        hostPath:
+          path: /
+      - name: host-tmp
+        hostPath:
+          path: /tmp
+      - name: scripts
+        configMap:
+          name: firecracker-installer
+          defaultMode: 0755
+---
+# Service to expose metrics and health checks
+apiVersion: v1
+kind: Service
+metadata:
+  name: firecracker-agents
+  namespace: firecracker-system
+spec:
+  type: ClusterIP
+  clusterIP: None  # Headless service for node discovery
+  selector:
+    app: firecracker-installer
+  ports:
+  - name: agent
+    port: 8090
+    targetPort: 8090 

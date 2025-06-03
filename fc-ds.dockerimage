@@ -1,0 +1,123 @@
+# Firecracker VM DaemonSet Image
+# Lightweight container for running Firecracker VM daemon on Kubernetes nodes
+# All scripts are provided via ConfigMap - no hardcoded scripts in image
+
+FROM python:3.11-slim
+
+# Install system dependencies
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    curl wget jq \
+    iproute2 iputils-ping netcat-traditional bridge-utils \
+    openssh-client \
+    genisoimage \
+    qemu-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Firecracker binary
+RUN ARCH=$(dpkg --print-architecture) && \
+    if [ "$ARCH" = "amd64" ]; then FIRECRACKER_ARCH="x86_64"; \
+    elif [ "$ARCH" = "arm64" ]; then FIRECRACKER_ARCH="aarch64"; \
+    else echo "Unsupported architecture: $ARCH" && exit 1; fi && \
+    FIRECRACKER_VERSION="v1.4.1" && \
+    wget -O /tmp/firecracker.tgz "https://github.com/firecracker-microvm/firecracker/releases/download/${FIRECRACKER_VERSION}/firecracker-${FIRECRACKER_VERSION}-${FIRECRACKER_ARCH}.tgz" && \
+    tar -xzf /tmp/firecracker.tgz -C /tmp && \
+    mv /tmp/release-${FIRECRACKER_VERSION}-${FIRECRACKER_ARCH}/firecracker-${FIRECRACKER_VERSION}-${FIRECRACKER_ARCH} /usr/local/bin/firecracker && \
+    mv /tmp/release-${FIRECRACKER_VERSION}-${FIRECRACKER_ARCH}/jailer-${FIRECRACKER_VERSION}-${FIRECRACKER_ARCH} /usr/local/bin/jailer && \
+    chmod +x /usr/local/bin/firecracker /usr/local/bin/jailer && \
+    rm -rf /tmp/firecracker.tgz /tmp/release-*
+
+# Create necessary directories
+RUN mkdir -p /opt/firecracker \
+    /opt/firecracker/kernels \
+    /opt/firecracker/rootfs \
+    /opt/firecracker/snapshots \
+    /opt/firecracker/logs \
+    /app \
+    && chmod 755 /opt/firecracker /app
+
+# Set working directory
+WORKDIR /app
+
+# Create startup script that uses ConfigMap scripts
+COPY <<EOF /app/start-daemon.sh
+#!/bin/bash
+set -euo pipefail
+
+echo "=== FIRECRACKER DAEMON STARTUP ==="
+echo "Timestamp: \$(date)"
+echo "Working directory: \$(pwd)"
+echo "User: \$(whoami)"
+
+# Verify ConfigMap scripts are mounted
+if [ ! -f "/app/firecracker-complete.sh" ]; then
+    echo "ERROR: firecracker-complete.sh not found - ConfigMap not mounted properly"
+    exit 1
+fi
+
+if [ ! -f "/app/firecracker-vm-daemon.py" ]; then
+    echo "ERROR: firecracker-vm-daemon.py not found - ConfigMap not mounted properly"
+    exit 1
+fi
+
+echo "✅ ConfigMap scripts found"
+
+# ConfigMap files are read-only, so we need to copy them to make them executable
+echo "Copying ConfigMap scripts to writable location..."
+cp /app/firecracker-complete.sh /tmp/firecracker-complete.sh
+cp /app/firecracker-vm-daemon.py /tmp/firecracker-vm-daemon.py
+chmod +x /tmp/firecracker-complete.sh
+chmod +x /tmp/firecracker-vm-daemon.py
+
+# Update environment variables to point to writable copies
+export FIRECRACKER_SCRIPT=/tmp/firecracker-complete.sh
+export SKIP_DEPS=true
+echo "Using scripts from: /tmp/"
+
+# Verify Firecracker installation
+if ! command -v firecracker >/dev/null 2>&1; then
+    echo "ERROR: Firecracker not found in PATH"
+    exit 1
+fi
+
+echo "Firecracker version: \$(firecracker --version)"
+
+# Check required devices
+echo "Checking required devices..."
+if [ ! -e /dev/kvm ]; then
+    echo "WARNING: /dev/kvm not available - nested virtualization may not work"
+fi
+
+# Check networking capabilities
+echo "Checking networking capabilities..."
+if ! ip link show >/dev/null 2>&1; then
+    echo "ERROR: Cannot access network interfaces"
+    exit 1
+fi
+
+echo "✅ Network access available"
+
+# Check file systems
+echo "Checking mounted volumes..."
+echo "Host firecracker directory: \$(ls -la /host/opt/firecracker 2>/dev/null | wc -l) items"
+echo "Snapshots directory: \$(ls -la /app/firecracker-data/snapshots 2>/dev/null | wc -l) items"
+echo "Kernels directory: \$(ls -la /app/firecracker-data/kernels 2>/dev/null | wc -l) items"
+echo "Images directory: \$(ls -la /app/firecracker-data/images 2>/dev/null | wc -l) items"
+
+# Start the Python daemon
+echo "Starting Firecracker VM daemon..."
+exec python3 /tmp/firecracker-vm-daemon.py
+EOF
+
+# Make startup script executable
+RUN chmod +x /app/start-daemon.sh
+
+# Expose daemon port
+EXPOSE 8090
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8090/health || exit 1
+
+# Run the startup script
+CMD ["/app/start-daemon.sh"] 

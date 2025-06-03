@@ -281,8 +281,16 @@ func (r *HorizontalRunnerAutoscalerReconciler) scaleTargetFromRD(ctx context.Con
 				}
 			}
 			runnerMap := make(map[string]struct{})
-			for _, items := range runnerList.Items {
-				runnerMap[items.Name] = struct{}{}
+			for _, runner := range runnerList.Items {
+				runnerMap[runner.Name] = struct{}{}
+				
+				// Log if this is a Firecracker runner for debugging
+				isFirecracker := (runner.Spec.Runtime != nil && runner.Spec.Runtime.Type == "firecracker") ||
+					(runner.Annotations != nil && runner.Annotations["runner.summerwind.dev/runtime"] == "firecracker")
+				
+				if isFirecracker {
+					r.Log.V(2).Info("Found Firecracker runner in map", "runner", runner.Name, "namespace", rd.Namespace)
+				}
 			}
 
 			return runnerMap, nil

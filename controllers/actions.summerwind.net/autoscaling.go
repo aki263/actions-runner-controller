@@ -333,6 +333,7 @@ func (r *HorizontalRunnerAutoscalerReconciler) suggestReplicasByPercentageRunner
 		numRunnersRegistered int
 		numRunnersBusy       int
 		numTerminatingBusy   int
+		numFirecrackerVMs    int
 	)
 
 	numRunners = len(runnerMap)
@@ -357,18 +358,61 @@ func (r *HorizontalRunnerAutoscalerReconciler) suggestReplicasByPercentageRunner
 		}
 	}
 
+	// Check if we're dealing with Firecracker VMs by looking for Runner resources with Firecracker runtime
+	var runnerResourceList v1alpha1.RunnerList
+	if err := r.Client.List(ctx, &runnerResourceList, client.InNamespace(hra.Namespace), client.MatchingLabels(map[string]string{
+		kindLabel: hra.Spec.ScaleTargetRef.Name,
+	})); err != nil {
+		return nil, err
+	}
+
+	// Map of Firecracker VMs that are running but don't have pods
+	firecrackerVMs := make(map[string]bool)
+	
+	for _, runner := range runnerResourceList.Items {
+		// Check if this is a Firecracker runner
+		isFirecracker := (runner.Spec.Runtime != nil && runner.Spec.Runtime.Type == "firecracker") ||
+			(runner.Annotations != nil && runner.Annotations["runner.summerwind.dev/runtime"] == "firecracker")
+		
+		if isFirecracker {
+			firecrackerVMs[runner.Name] = true
+			numFirecrackerVMs++
+		}
+	}
+
 	for _, runner := range runners {
-		if _, ok := runnerMap[*runner.Name]; ok {
+		runnerName := *runner.Name
+		
+		// First check if this runner has a corresponding pod (traditional runners)
+		if _, ok := runnerMap[runnerName]; ok {
 			numRunnersRegistered++
 
 			if runner.GetBusy() {
 				numRunnersBusy++
-			} else if _, ok := busyTerminatingRunnerPods[*runner.Name]; ok {
+			} else if _, ok := busyTerminatingRunnerPods[runnerName]; ok {
 				numTerminatingBusy++
 			}
 
-			delete(busyTerminatingRunnerPods, *runner.Name)
+			delete(busyTerminatingRunnerPods, runnerName)
+		} else if _, isFirecrackerVM := firecrackerVMs[runnerName]; isFirecrackerVM {
+			// This is a Firecracker VM registered with GitHub but no pod
+			numRunnersRegistered++
+			
+			if runner.GetBusy() {
+				numRunnersBusy++
+			}
+			// Note: Firecracker VMs don't have the concept of "busy terminating" via pod annotations
 		}
+	}
+
+	// If we have Firecracker VMs, update numRunners to include them
+	if numFirecrackerVMs > 0 {
+		// For Firecracker deployments, count the number of VM runners instead of pods
+		numRunners = numFirecrackerVMs
+		r.Log.V(1).Info("Detected Firecracker deployment", 
+			"numFirecrackerVMs", numFirecrackerVMs,
+			"numRunners", numRunners,
+			"numRunnersRegistered", numRunnersRegistered)
 	}
 
 	// Remaining busyTerminatingRunnerPods are runners that were not on the ListRunners API response yet
@@ -420,6 +464,7 @@ func (r *HorizontalRunnerAutoscalerReconciler) suggestReplicasByPercentageRunner
 		"num_runners_registered", numRunnersRegistered,
 		"num_runners_busy", numRunnersBusy,
 		"num_terminating_busy", numTerminatingBusy,
+		"num_firecracker_vms", numFirecrackerVMs,
 		"namespace", hra.Namespace,
 		"kind", st.kind,
 		"name", st.st,

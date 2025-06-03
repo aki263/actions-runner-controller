@@ -3398,7 +3398,101 @@ spec:
                               description: 'Requests describes the minimum amount of compute resources required. If Requests is omitted for a container, it defaults to Limits if that is explicitly specified, otherwise to an implementation-defined value. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
                               type: object
                           type: object
-                        runtimeClassName:
+                runtime:
+                  description: Runtime configuration for the runner (Firecracker, container, etc.)
+                  properties:
+                    type:
+                      description: Type specifies the runtime type (firecracker, container)
+                      type: string
+                      enum:
+                        - container
+                        - firecracker
+                      default: container
+                    firecracker:
+                      description: Firecracker contains Firecracker-specific runtime configuration
+                      properties:
+                        kernelImagePath:
+                          description: KernelImagePath is the path to the kernel image to use for Firecracker VMs
+                          type: string
+                        rootfsImagePath:
+                          description: RootfsImagePath is the path to the root filesystem image to use for Firecracker VMs
+                          type: string
+                        snapshotName:
+                          description: SnapshotName is the name of the snapshot to use instead of RootfsImagePath
+                          type: string
+                        memoryMiB:
+                          description: MemoryMiB is the amount of memory in MiB to allocate to the VM
+                          type: integer
+                          default: 2048
+                        vcpus:
+                          description: VCPUs is the number of virtual CPUs to allocate to the VM
+                          type: integer
+                          default: 2
+                        networkConfig:
+                          description: NetworkConfig defines the network configuration for the VM
+                          properties:
+                            interface:
+                              description: Interface is the network interface name inside the VM (usually eth0)
+                              type: string
+                              default: eth0
+                            subnetCIDR:
+                              description: SubnetCIDR is the subnet CIDR for static IP assignment
+                              type: string
+                              default: 172.16.0.0/24
+                            gateway:
+                              description: Gateway is the gateway IP for static IP assignment
+                              type: string
+                              default: 172.16.0.1
+                            bridgeName:
+                              description: BridgeName is the bridge device name on the host
+                              type: string
+                              default: fc-br0
+                            tapDeviceName:
+                              description: TAPDeviceName is the TAP device name on the host
+                              type: string
+                              default: fc-tap0
+                            networkMode:
+                              description: NetworkMode defines the networking approach (bridge, macvlan, host, nat)
+                              type: string
+                              enum:
+                                - bridge
+                                - macvlan
+                                - host
+                                - nat
+                              default: bridge
+                            parentInterface:
+                              description: ParentInterface is the host interface to use for macvlan or nat modes
+                              type: string
+                            macvlanMode:
+                              description: MacvlanMode defines the macvlan mode (bridge, vepa, private, passthru)
+                              type: string
+                              enum:
+                                - bridge
+                                - vepa
+                                - private
+                                - passthru
+                              default: bridge
+                            dhcpEnabled:
+                              description: DHCPEnabled indicates if the VM should use DHCP instead of static IP
+                              type: boolean
+                          type: object
+                        ephemeralMode:
+                          description: EphemeralMode indicates if the VM should be destroyed after job completion
+                          type: boolean
+                        useHostBridge:
+                          description: UseHostBridge indicates if the VM should use host bridge networking instead of static IPs
+                          type: boolean
+                        dockerMode:
+                          description: DockerMode indicates if the runner should run directly like a container (not as systemd service)
+                          type: boolean
+                        arcMode:
+                          description: ARCMode enables ARC integration with job lifecycle monitoring
+                          type: boolean
+                        arcControllerURL:
+                          description: ARCControllerURL is the URL for ARC controller status reporting
+                          type: string
+                      type: object
+                  type: object                         runtimeClassName:
                           description: 'RuntimeClassName is the container runtime configuration that containers should run under. More info: https://kubernetes.io/docs/concepts/containers/runtime-class'
                           type: string
                         securityContext:

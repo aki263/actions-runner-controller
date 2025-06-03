@@ -18,6 +18,7 @@ package actionssummerwindnet
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -131,7 +132,7 @@ func (r *RunnerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 	} else {
 		// Request to remove a runner. DeletionTimestamp was set in the runner - we need to unregister runner
-		if runner.Spec.Runtime != nil && runner.Spec.Runtime.Type == "firecracker" {
+		if isFirecrackerRunner(&runner) {
 			// Firecracker VM deletion - no pod to check
 			r.GitHubClient.DeinitForRunner(&runner)
 			return r.processRunnerDeletion(runner, ctx, log, nil)
@@ -153,12 +154,111 @@ func (r *RunnerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	// Handle Firecracker VM status
-	if runner.Spec.Runtime != nil && runner.Spec.Runtime.Type == "firecracker" {
+	if isFirecrackerRunner(&runner) {
 		return r.handleFirecrackerRunnerStatus(ctx, runner, log)
 	}
 
 	// Handle container-based runner status
 	return r.handleContainerRunnerStatus(ctx, runner, log)
+}
+
+// isFirecrackerRunner checks if a runner uses Firecracker runtime
+func isFirecrackerRunner(runner *v1alpha1.Runner) bool {
+	// Check spec.runtime.type first (preferred method)
+	if runner.Spec.Runtime != nil && runner.Spec.Runtime.Type == "firecracker" {
+		return true
+	}
+	
+	// Fallback to annotation-based detection
+	if runner.Annotations != nil {
+		if runtime, exists := runner.Annotations["runner.summerwind.dev/runtime"]; exists && runtime == "firecracker" {
+			return true
+		}
+	}
+	
+	return false
+}
+
+// getFirecrackerConfigFromAnnotations extracts Firecracker configuration from annotations
+func getFirecrackerConfigFromAnnotations(runner *v1alpha1.Runner) *v1alpha1.FirecrackerRuntime {
+	if runner.Annotations == nil {
+		return nil
+	}
+	
+	// Check if this is a Firecracker runner via annotations
+	if runtime, exists := runner.Annotations["runner.summerwind.dev/runtime"]; !exists || runtime != "firecracker" {
+		return nil
+	}
+	
+	config := &v1alpha1.FirecrackerRuntime{
+		EphemeralMode: true, // Default
+		ARCMode:      true,  // Default for annotation-based config
+	}
+	
+	// Parse memory
+	if memory, exists := runner.Annotations["runner.summerwind.dev/firecracker-memory"]; exists {
+		if memMiB, err := strconv.Atoi(memory); err == nil {
+			config.MemoryMiB = memMiB
+		}
+	}
+	
+	// Parse VCPUs
+	if vcpus, exists := runner.Annotations["runner.summerwind.dev/firecracker-vcpus"]; exists {
+		if cpus, err := strconv.Atoi(vcpus); err == nil {
+			config.VCPUs = cpus
+		}
+	}
+	
+	// Parse kernel path
+	if kernel, exists := runner.Annotations["runner.summerwind.dev/firecracker-kernel"]; exists {
+		config.KernelImagePath = kernel
+	}
+	
+	// Parse snapshot name
+	if snapshot, exists := runner.Annotations["runner.summerwind.dev/firecracker-snapshot"]; exists {
+		config.SnapshotName = snapshot
+	}
+	
+	// Parse ARC controller URL
+	if arcURL, exists := runner.Annotations["runner.summerwind.dev/firecracker-arc-url"]; exists {
+		config.ARCControllerURL = arcURL
+	}
+	
+	// Parse ephemeral mode
+	if ephemeral, exists := runner.Annotations["runner.summerwind.dev/firecracker-ephemeral"]; exists {
+		config.EphemeralMode = ephemeral == "true"
+	}
+	
+	// Parse ARC mode
+	if arcMode, exists := runner.Annotations["runner.summerwind.dev/firecracker-arc-mode"]; exists {
+		config.ARCMode = arcMode == "true"
+	}
+	
+	// Parse network configuration from JSON string
+	if networkStr, exists := runner.Annotations["runner.summerwind.dev/firecracker-network"]; exists {
+		var networkData map[string]interface{}
+		if err := json.Unmarshal([]byte(networkStr), &networkData); err == nil {
+			config.NetworkConfig = &v1alpha1.FirecrackerNetworkConfig{}
+			
+			if iface, ok := networkData["interface"].(string); ok {
+				config.NetworkConfig.Interface = iface
+			}
+			if mode, ok := networkData["networkMode"].(string); ok {
+				config.NetworkConfig.NetworkMode = mode
+			}
+			if bridge, ok := networkData["bridgeName"].(string); ok {
+				config.NetworkConfig.BridgeName = bridge
+			}
+			if dhcp, ok := networkData["dhcpEnabled"].(bool); ok {
+				config.NetworkConfig.DHCPEnabled = dhcp
+			}
+		}
+	}
+	
+	// Enable host bridge mode by default for annotation-based config
+	config.UseHostBridge = true
+	
+	return config
 }
 
 func (r *RunnerReconciler) handleFirecrackerRunnerStatus(ctx context.Context, runner v1alpha1.Runner, log logr.Logger) (ctrl.Result, error) {
@@ -303,8 +403,8 @@ func (r *RunnerReconciler) processRunnerCreationWithLock(ctx context.Context, ru
 	
 	log.Info("Set VM creation lock, proceeding with creation")
 	
-	// Directly call Firecracker VM creation, bypassing status handler
-	return r.processFirecrackerRunnerCreation(ctx, *updated, log)
+	// Call processRunnerCreation to ensure registration token is retrieved first
+	return r.processRunnerCreation(ctx, *updated, log)
 }
 
 func (r *RunnerReconciler) handleContainerRunnerStatus(ctx context.Context, runner v1alpha1.Runner, log logr.Logger) (ctrl.Result, error) {
@@ -442,7 +542,7 @@ func ephemeralRunnerContainerStatus(pod *corev1.Pod) *corev1.ContainerStatus {
 
 func (r *RunnerReconciler) processRunnerDeletion(runner v1alpha1.Runner, ctx context.Context, log logr.Logger, pod *corev1.Pod) (reconcile.Result, error) {
 	// Handle Firecracker VM cleanup if this is a Firecracker runner
-	if runner.Spec.Runtime != nil && runner.Spec.Runtime.Type == "firecracker" {
+	if isFirecrackerRunner(&runner) {
 		if r.FirecrackerVMManager != nil {
 			log.Info("Cleaning up Firecracker VM", "runner", runner.Name)
 			if err := r.FirecrackerVMManager.DeleteVM(ctx, &runner); err != nil {
@@ -474,13 +574,23 @@ func (r *RunnerReconciler) processRunnerDeletion(runner v1alpha1.Runner, ctx con
 
 func (r *RunnerReconciler) processRunnerCreation(ctx context.Context, runner v1alpha1.Runner, log logr.Logger) (reconcile.Result, error) {
 	if updated, err := r.updateRegistrationToken(ctx, runner); err != nil {
-		return ctrl.Result{RequeueAfter: RetryDelayOnCreateRegistrationError}, nil
+		return ctrl.Result{RequeueAfter: RetryDelayOnCreateRegistrationError}, err
 	} else if updated {
-		return ctrl.Result{Requeue: true}, nil
+		// Token was just updated, requeue to get the updated runner object with the token
+		// but don't return early - we need to continue with VM creation in the same reconciliation
+		log.Info("Registration token updated, continuing with VM creation")
+		
+		// Refresh the runner object to get the updated token
+		var updatedRunner v1alpha1.Runner
+		if err := r.Get(ctx, types.NamespacedName{Name: runner.Name, Namespace: runner.Namespace}, &updatedRunner); err != nil {
+			log.Error(err, "Failed to get updated runner after token update")
+			return ctrl.Result{RequeueAfter: time.Second * 30}, err
+		}
+		runner = updatedRunner
 	}
 
 	// Check if this runner should use Firecracker VMs
-	if runner.Spec.Runtime != nil && runner.Spec.Runtime.Type == "firecracker" {
+	if isFirecrackerRunner(&runner) {
 		return r.processFirecrackerRunnerCreation(ctx, runner, log)
 	}
 
@@ -506,7 +616,25 @@ func (r *RunnerReconciler) processFirecrackerRunnerCreation(ctx context.Context,
 		return ctrl.Result{RequeueAfter: time.Second * 30}, nil
 	}
 
-	log.Info("Creating Firecracker VM for runner", "runtime", runner.Spec.Runtime.Type)
+	// Determine runtime type safely
+	runtimeType := "firecracker"
+	if runner.Spec.Runtime != nil {
+		runtimeType = runner.Spec.Runtime.Type
+	}
+	
+	log.Info("Creating Firecracker VM for runner", "runtime", runtimeType)
+
+	// Check if FirecrackerVMManager is properly initialized
+	if r.FirecrackerVMManager == nil {
+		err := fmt.Errorf("FirecrackerVMManager is not initialized")
+		log.Error(err, "FirecrackerVMManager is nil - check ENABLE_FIRECRACKER environment variable")
+		r.Recorder.Event(&runner, corev1.EventTypeWarning, "VMManagerNotInitialized", "FirecrackerVMManager is not initialized")
+		
+		// Clean up creation lock on failure
+		r.cleanupCreationLock(ctx, runner, log)
+		
+		return ctrl.Result{RequeueAfter: time.Minute}, err
+	}
 
 	// Create the Firecracker VM
 	vmInfo, err := r.FirecrackerVMManager.CreateVM(ctx, &runner, registrationToken)

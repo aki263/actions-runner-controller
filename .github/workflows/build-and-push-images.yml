@@ -1,0 +1,109 @@
+name: Build and Push Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag for the images'
+        required: true
+        default: 'v1'
+        type: string
+      build_variants:
+        description: 'Image variants to build (comma-separated: standard,firecracker,firecracker-optimized,firecracker-ds)'
+        required: true
+        default: 'standard,firecracker,firecracker-optimized,firecracker-ds'
+        type: string
+
+env:
+  REGISTRY: us-west1-docker.pkg.dev
+  PROJECT_ID: tenki-cloud
+  REPOSITORY: tenki-runners-prod
+  IMAGE_NAME: arc
+  DOCKER_IMAGE_NAME: us-west1-docker.pkg.dev/tenki-cloud/tenki-runners-prod/arc
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+    - name: Configure Docker to use gcloud as credential helper
+      run: |
+        gcloud auth configure-docker us-west1-docker.pkg.dev
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.21'
+
+    - name: Build and push standard image
+      if: contains(github.event.inputs.build_variants, 'standard')
+      run: |
+        make docker-buildx
+      env:
+        VERSION: ${{ github.event.inputs.version }}
+        DOCKER_IMAGE_NAME: ${{ env.DOCKER_IMAGE_NAME }}
+        IMG_RESULT: push
+        PLATFORMS: linux/amd64,linux/arm64
+
+    - name: Build and push Firecracker image
+      if: contains(github.event.inputs.build_variants, 'firecracker')
+      run: |
+        make docker-buildx-firecracker
+      env:
+        VERSION: ${{ github.event.inputs.version }}
+        DOCKER_IMAGE_NAME: ${{ env.DOCKER_IMAGE_NAME }}
+        IMG_RESULT: push
+        PLATFORMS: linux/amd64,linux/arm64
+
+    - name: Build and push Firecracker optimized image
+      if: contains(github.event.inputs.build_variants, 'firecracker-optimized')
+      run: |
+        make docker-buildx-firecracker-optimized
+      env:
+        VERSION: ${{ github.event.inputs.version }}
+        DOCKER_IMAGE_NAME: ${{ env.DOCKER_IMAGE_NAME }}
+        IMG_RESULT: push
+        PLATFORMS: linux/amd64,linux/arm64
+
+    - name: Build and push Firecracker DaemonSet image
+      if: contains(github.event.inputs.build_variants, 'firecracker-ds')
+      run: |
+        make docker-buildx-firecracker-ds
+      env:
+        VERSION: ${{ github.event.inputs.version }}
+        DOCKER_IMAGE_NAME: ${{ env.DOCKER_IMAGE_NAME }}
+        IMG_RESULT: push
+        PLATFORMS: linux/amd64,linux/arm64
+
+    - name: List built images
+      run: |
+        echo "Built and pushed the following images:"
+        if [[ "${{ github.event.inputs.build_variants }}" == *"standard"* ]]; then
+          echo "- ${{ env.DOCKER_IMAGE_NAME }}:${{ github.event.inputs.version }}"
+        fi
+        if [[ "${{ github.event.inputs.build_variants }}" == *"firecracker"* ]]; then
+          echo "- ${{ env.DOCKER_IMAGE_NAME }}:${{ github.event.inputs.version }}-firecracker"
+          echo "- ${{ env.DOCKER_IMAGE_NAME }}:firecracker-latest"
+        fi
+        if [[ "${{ github.event.inputs.build_variants }}" == *"firecracker-optimized"* ]]; then
+          echo "- ${{ env.DOCKER_IMAGE_NAME }}:${{ github.event.inputs.version }}-firecracker-optimized"
+          echo "- ${{ env.DOCKER_IMAGE_NAME }}:firecracker-optimized"
+        fi
+        if [[ "${{ github.event.inputs.build_variants }}" == *"firecracker-ds"* ]]; then
+          echo "- ${{ env.DOCKER_IMAGE_NAME }}:${{ github.event.inputs.version }} (DaemonSet variant)"
+          echo "- ${{ env.DOCKER_IMAGE_NAME }}:latest (DaemonSet variant)"
+        fi 

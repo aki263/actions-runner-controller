@@ -72,6 +72,7 @@ type VMInfo struct {
 	VMID               string    `json:"vm_id"`
 	IP                 string    `json:"ip"`
 	MAC                string    `json:"mac"`
+	Status             string    `json:"status"`
 	Networking         string    `json:"networking"`
 	Bridge             string    `json:"bridge"`
 	TAP                string    `json:"tap"`
@@ -217,6 +218,7 @@ func (m *FirecrackerVMManager) CreateVM(ctx context.Context, runner *v1alpha1.Ru
 	// Update VM info with final details
 	vmInfo.Name = runner.Name
 	vmInfo.VMID = vmID
+	vmInfo.Status = "running"  // Set status to running after successful creation
 	vmInfo.GitHubURL = m.getGitHubURL(runner)
 	vmInfo.Labels = strings.Join(runner.Spec.Labels, ",")
 	vmInfo.Created = time.Now()
@@ -376,12 +378,18 @@ func (m *FirecrackerVMManager) GetVMStatus(ctx context.Context, runner *v1alpha1
 		return nil, fmt.Errorf("failed to load VM info: %w", err)
 	}
 
-	// Check if process is still running
+	// Check if process is still running and update status
 	if vmInfo.PID > 0 {
 		if err := exec.Command("kill", "-0", strconv.Itoa(vmInfo.PID)).Run(); err != nil {
 			// Process not running
 			vmInfo.PID = 0
+			vmInfo.Status = "stopped"
+		} else {
+			// Process is running
+			vmInfo.Status = "running"
 		}
+	} else {
+		vmInfo.Status = "stopped"
 	}
 
 	return vmInfo, nil
@@ -501,7 +509,8 @@ func (m *FirecrackerVMManager) generateSSHKey(keyPath string) error {
 
 func (m *FirecrackerVMManager) setupNetworking(vmID string, fcConfig *v1alpha1.FirecrackerRuntime) (*VMInfo, error) {
 	vmInfo := &VMInfo{
-		MAC: m.generateRandomMAC(),
+		MAC:    m.generateRandomMAC(),
+		Status: "creating",  // Set initial status
 	}
 
 	// Set default network mode if not specified

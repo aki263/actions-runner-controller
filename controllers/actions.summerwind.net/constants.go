@@ -3,8 +3,9 @@ package actionssummerwindnet
 import "time"
 
 const (
-	LabelKeyRunnerSetName = "runnerset-name"
-	LabelKeyRunner        = "actions-runner"
+	LabelKeyRunnerSetName        = "runnerset-name"
+	LabelKeyRunnerDeploymentName = "runner-deployment-name"
+	LabelKeyRunner               = "actions-runner"
 )
 
 const (

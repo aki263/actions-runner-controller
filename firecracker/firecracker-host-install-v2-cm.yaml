@@ -1,0 +1,361 @@
+apiVersion: v1
+data:
+  host-install-improved.sh: "#!/bin/bash\n\n# Host-Based Firecracker Installation
+    Script v2\n# Improved for production scaling with dynamic resource management\n\nset
+    -euo pipefail\n\nINSTALL_DIR=\"/opt/firecracker\"\nDATA_DIR=\"/opt/firecracker/firecracker-data\"\nSERVICE_USER=\"firecracker\"\nVM_AGENT_PORT=\"8091\"\n\n#
+    Dynamic resource configuration\nCPU_OVERSUBSCRIPTION_RATIO=\"4\"    # Allow 4x
+    CPU oversubscription\nMEMORY_RESERVATION_PCT=\"20\"       # Reserve 20% of memory
+    for host OS\nMEMORY_UTILIZATION_PCT=\"80\"       # Use up to 80% of available
+    memory\nMIN_FREE_MEMORY_MB=\"2048\"         # Always keep 2GB free\n\n# Colors\nGREEN='\\033[0;32m'\nYELLOW='\\033[1;33m'\nRED='\\033[0;31m'\nNC='\\033[0m'\n\nprint_info()
+    {\n    echo -e \"${GREEN}[INFO]${NC} $1\"\n}\n\nprint_warning() {\n    echo -e
+    \"${YELLOW}[WARNING]${NC} $1\"\n}\n\nprint_error() {\n    echo -e \"${RED}[ERROR]${NC}
+    $1\"\n}\n\n# Check if running as root\nif [[ $EUID -ne 0 ]]; then\n   print_error
+    \"This script must be run as root\"\n   exit 1\nfi\n\nprint_info \"Installing
+    Firecracker VM management on host...\"\n\n# Get system information for dynamic
+    configuration\nTOTAL_MEMORY_MB=$(free -m | awk 'NR==2{print $2}')\nTOTAL_CPUS=$(nproc)\nHOSTNAME=$(hostname)\n\nprint_info
+    \"System Resources:\"\nprint_info \"  Hostname: $HOSTNAME\"\nprint_info \"  Total
+    Memory: ${TOTAL_MEMORY_MB}MB\"\nprint_info \"  Total CPUs: $TOTAL_CPUS\"\nprint_info
+    \"  CPU Oversubscription: ${CPU_OVERSUBSCRIPTION_RATIO}x\"\n\n# Calculate dynamic
+    limits\nRESERVED_MEMORY_MB=$((TOTAL_MEMORY_MB * MEMORY_RESERVATION_PCT / 100))\nAVAILABLE_MEMORY_MB=$((TOTAL_MEMORY_MB
+    - RESERVED_MEMORY_MB))\nMAX_USABLE_MEMORY_MB=$((AVAILABLE_MEMORY_MB * MEMORY_UTILIZATION_PCT
+    / 100))\nMAX_VIRTUAL_CPUS=$((TOTAL_CPUS * CPU_OVERSUBSCRIPTION_RATIO))\n\nprint_info
+    \"Calculated Limits:\"\nprint_info \"  Reserved for OS: ${RESERVED_MEMORY_MB}MB\"\nprint_info
+    \"  Max VM Memory: ${MAX_USABLE_MEMORY_MB}MB\"\nprint_info \"  Max Virtual CPUs:
+    $MAX_VIRTUAL_CPUS\"\n\n# Create directories\nprint_info \"Creating directories...\"\nmkdir
+    -p \"$INSTALL_DIR\"\nmkdir -p \"$DATA_DIR\"/{kernels,snapshots,instances,images}\n\n#
+    Create service user\nprint_info \"Creating service user...\"\nif ! id \"$SERVICE_USER\"
+    &>/dev/null; then\n    useradd -r -s /bin/bash -d \"$INSTALL_DIR\" \"$SERVICE_USER\"\nfi\n\n#
+    Install dependencies\nprint_info \"Installing dependencies...\"\napt update\napt
+    install -y curl wget jq python3 python3-pip iproute2 iptables bridge-utils python3-psutil\n\n#
+    Install Python dependencies\n# print_info \"Installing Python dependencies...\"\n#
+    pip3 install psutil\n\n# Install Firecracker\nprint_info \"Installing Firecracker...\"\nif
+    ! command -v firecracker &> /dev/null; then\n    FIRECRACKER_VERSION=\"v1.7.0\"\n
+    \   ARCH=$(uname -m)\n    if [[ \"$ARCH\" == \"x86_64\" ]]; then\n        FIRECRACKER_ARCH=\"x86_64\"\n
+    \   elif [[ \"$ARCH\" == \"aarch64\" ]]; then\n        FIRECRACKER_ARCH=\"aarch64\"\n
+    \   else\n        print_error \"Unsupported architecture: $ARCH\"\n        exit
+    1\n    fi\n    \n    wget -O /tmp/firecracker.tgz \\\n        \"https://github.com/firecracker-microvm/firecracker/releases/download/${FIRECRACKER_VERSION}/firecracker-${FIRECRACKER_VERSION}-${FIRECRACKER_ARCH}.tgz\"\n
+    \   \n    tar -xzf /tmp/firecracker.tgz -C /tmp/\n    mv /tmp/release-${FIRECRACKER_VERSION}-${FIRECRACKER_ARCH}/firecracker-${FIRECRACKER_VERSION}-${FIRECRACKER_ARCH}
+    /usr/local/bin/firecracker\n    chmod +x /usr/local/bin/firecracker\n    rm -rf
+    /tmp/firecracker.tgz /tmp/release-*\nfi\n\n# Copy firecracker-complete.sh (should
+    be in /tmp/)\nprint_info \"Installing Firecracker management scripts...\"\nif
+    [[ -f \"/tmp/firecracker-complete.sh\" ]]; then\n    cp /tmp/firecracker-complete.sh
+    \"$INSTALL_DIR/\"\n    chmod +x \"$INSTALL_DIR/firecracker-complete.sh\"\n    print_info
+    \"✅ firecracker-complete.sh installed\"\nelse\n    print_error \"firecracker-complete.sh
+    not found in /tmp/\"\n    exit 1\nfi\n\n# Create improved VM agent with dynamic
+    resource management\ncat > \"$INSTALL_DIR/vm-agent.py\" << 'EOF'\n#!/usr/bin/env
+    python3\n\nimport json\nimport subprocess\nimport threading\nimport time\nimport
+    psutil\nfrom http.server import HTTPServer, BaseHTTPRequestHandler\nfrom urllib.parse
+    import urlparse, parse_qs\nimport logging\nimport os\nimport signal\nimport sys\n\n#
+    Configuration\nLISTEN_PORT = 8091\nSCRIPT_PATH = \"/opt/firecracker/firecracker-complete.sh\"\nDATA_DIR
+    = \"/opt/firecracker/firecracker-data\"\nRESOURCE_FILE = \"/opt/firecracker/resources.json\"\n\n#
+    These will be set from command line or defaults\nTOTAL_MEMORY_MB = 0\nTOTAL_CPUS
+    = 0\nCPU_OVERSUBSCRIPTION_RATIO = 4\nMEMORY_RESERVATION_PCT = 20\nMEMORY_UTILIZATION_PCT
+    = 80\nMIN_FREE_MEMORY_MB = 2048\n\n# Will be calculated in init\nRESERVED_MEMORY_MB
+    = 0\nAVAILABLE_MEMORY_MB = 0\nMAX_USABLE_MEMORY_MB = 0\nMAX_VIRTUAL_CPUS = 0\n\ndef
+    init_system_limits():\n    global TOTAL_MEMORY_MB, TOTAL_CPUS, RESERVED_MEMORY_MB,
+    AVAILABLE_MEMORY_MB, MAX_USABLE_MEMORY_MB, MAX_VIRTUAL_CPUS\n    \n    # Get system
+    resources\n    memory = psutil.virtual_memory()\n    TOTAL_MEMORY_MB = memory.total
+    // (1024 * 1024)\n    TOTAL_CPUS = psutil.cpu_count()\n    \n    # Calculate limits\n
+    \   RESERVED_MEMORY_MB = TOTAL_MEMORY_MB * MEMORY_RESERVATION_PCT // 100\n    AVAILABLE_MEMORY_MB
+    = TOTAL_MEMORY_MB - RESERVED_MEMORY_MB\n    MAX_USABLE_MEMORY_MB = AVAILABLE_MEMORY_MB
+    * MEMORY_UTILIZATION_PCT // 100\n    MAX_VIRTUAL_CPUS = TOTAL_CPUS * CPU_OVERSUBSCRIPTION_RATIO\n
+    \   \n    print(f\"Agent starting with dynamic limits:\")\n    print(f\"  Total
+    Memory: {TOTAL_MEMORY_MB}MB\")\n    print(f\"  Max VM Memory: {MAX_USABLE_MEMORY_MB}MB\")\n
+    \   print(f\"  Max Virtual CPUs: {MAX_VIRTUAL_CPUS}\")\n\n# Setup logging\nlogging.basicConfig(\n
+    \   level=logging.INFO,\n    format='%(asctime)s - %(levelname)s - %(message)s',\n
+    \   handlers=[\n        logging.FileHandler('/var/log/firecracker-agent.log'),\n
+    \       logging.StreamHandler()\n    ]\n)\n\nclass DynamicResourceManager:\n    def
+    __init__(self):\n        self.resource_file = RESOURCE_FILE\n        self.load_resources()\n
+    \       \n        # Start cleanup thread\n        self.cleanup_thread = threading.Thread(target=self.cleanup_dead_vms,
+    daemon=True)\n        self.cleanup_thread.start()\n    \n    def load_resources(self):\n
+    \       try:\n            with open(self.resource_file, 'r') as f:\n                self.resources
+    = json.load(f)\n        except FileNotFoundError:\n            self.resources
+    = {\"vms\": {}, \"total_memory_mb\": 0, \"total_virtual_cpus\": 0}\n            self.save_resources()\n
+    \   \n    def save_resources(self):\n        with open(self.resource_file, 'w')
+    as f:\n            json.dump(self.resources, f, indent=2)\n    \n    def get_system_resources(self):\n
+    \       memory = psutil.virtual_memory()\n        cpu_percent = psutil.cpu_percent(interval=1)\n
+    \       load_avg = os.getloadavg()\n        \n        return {\n            \"total_memory_mb\":
+    memory.total // (1024 * 1024),\n            \"available_memory_mb\": memory.available
+    // (1024 * 1024),\n            \"used_memory_mb\": (memory.total - memory.available)
+    // (1024 * 1024),\n            \"memory_percent\": memory.percent,\n            \"total_cpus\":
+    TOTAL_CPUS,\n            \"cpu_percent\": cpu_percent,\n            \"load_1min\":
+    load_avg[0],\n            \"load_5min\": load_avg[1],\n            \"load_15min\":
+    load_avg[2],\n            # Resource limits\n            \"max_usable_memory_mb\":
+    MAX_USABLE_MEMORY_MB,\n            \"max_virtual_cpus\": MAX_VIRTUAL_CPUS,\n            \"cpu_oversubscription_ratio\":
+    CPU_OVERSUBSCRIPTION_RATIO\n        }\n    \n    def can_create_vm(self, memory_mb,
+    cpus):\n        system = self.get_system_resources()\n        \n        # Check
+    memory limit (hard limit)\n        used_memory = self.resources[\"total_memory_mb\"]\n
+    \       if used_memory + memory_mb > MAX_USABLE_MEMORY_MB:\n            return
+    False, f\"Memory limit exceeded: {used_memory + memory_mb}MB > {MAX_USABLE_MEMORY_MB}MB\"\n
+    \       \n        # Check that we maintain minimum free memory\n        if system[\"available_memory_mb\"]
+    - memory_mb < MIN_FREE_MEMORY_MB:\n            return False, f\"Would leave less
+    than {MIN_FREE_MEMORY_MB}MB free memory\"\n        \n        # Check virtual CPU
+    limit (soft limit with oversubscription)\n        used_vcpus = self.resources[\"total_virtual_cpus\"]\n
+    \       if used_vcpus + cpus > MAX_VIRTUAL_CPUS:\n            return False, f\"Virtual
+    CPU limit exceeded: {used_vcpus + cpus} > {MAX_VIRTUAL_CPUS}\"\n        \n        #
+    Additional health checks\n        if system[\"memory_percent\"] > 90:\n            return
+    False, f\"System memory usage too high: {system['memory_percent']}%\"\n        \n
+    \       if system[\"load_5min\"] > (TOTAL_CPUS * 2):\n            return False,
+    f\"System load too high: {system['load_5min']} > {TOTAL_CPUS * 2}\"\n        \n
+    \       return True, \"OK\"\n    \n    def reserve_resources(self, vm_name, memory_mb,
+    cpus):\n        self.resources[\"vms\"][vm_name] = {\n            \"memory_mb\":
+    memory_mb,\n            \"cpus\": cpus,\n            \"created_at\": time.time(),\n
+    \           \"last_seen\": time.time(),\n            \"status\": \"creating\"\n
+    \       }\n        self.resources[\"total_memory_mb\"] += memory_mb\n        self.resources[\"total_virtual_cpus\"]
+    += cpus\n        self.save_resources()\n        \n        logging.info(f\"Reserved
+    resources for {vm_name}: {memory_mb}MB, {cpus} vCPUs\")\n        logging.info(f\"Total
+    allocated: {self.resources['total_memory_mb']}MB, {self.resources['total_virtual_cpus']}
+    vCPUs\")\n    \n    def release_resources(self, vm_name):\n        if vm_name
+    in self.resources[\"vms\"]:\n            vm_resources = self.resources[\"vms\"][vm_name]\n
+    \           self.resources[\"total_memory_mb\"] -= vm_resources[\"memory_mb\"]\n
+    \           self.resources[\"total_virtual_cpus\"] -= vm_resources[\"cpus\"]\n
+    \           del self.resources[\"vms\"][vm_name]\n            self.save_resources()\n
+    \           \n            logging.info(f\"Released resources for {vm_name}: {vm_resources['memory_mb']}MB,
+    {vm_resources['cpus']} vCPUs\")\n    \n    def update_vm_status(self, vm_name,
+    status):\n        if vm_name in self.resources[\"vms\"]:\n            self.resources[\"vms\"][vm_name][\"status\"]
+    = status\n            self.resources[\"vms\"][vm_name][\"last_seen\"] = time.time()\n
+    \           self.save_resources()\n    \n    def get_vm_status(self, vm_name):\n
+    \       \"\"\"Get VM status by checking if Firecracker process is running\"\"\"\n
+    \       if vm_name not in self.resources[\"vms\"]:\n            return None\n
+    \           \n        vm_data = self.resources[\"vms\"][vm_name]\n        \n        #
+    Check if VM process is running by looking for firecracker process\n        vm_id
+    = vm_name.lower().replace('-', '').replace('_', '')[:8]\n        is_running =
+    False\n        \n        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):\n
+    \           try:\n                if proc.info['name'] == 'firecracker':\n                    cmdline
+    = proc.info['cmdline']\n                    for arg in cmdline:\n                        if
+    f'instances/{vm_id}' in arg and 'firecracker.socket' in arg:\n                            is_running
+    = True\n                            break\n                if is_running:\n                    break\n
+    \           except (psutil.NoSuchProcess, psutil.AccessDenied):\n                continue\n
+    \       \n        status = \"running\" if is_running else \"stopped\"\n        \n
+    \       # Update status in resources\n        self.update_vm_status(vm_name, status)\n
+    \       \n        return {\n            \"vm_name\": vm_name,\n            \"vm_id\":
+    vm_id,\n            \"status\": status,\n            \"memory_mb\": vm_data[\"memory_mb\"],\n
+    \           \"cpus\": vm_data[\"cpus\"],\n            \"created_at\": vm_data[\"created_at\"],\n
+    \           \"last_seen\": vm_data.get(\"last_seen\", vm_data[\"created_at\"])\n
+    \       }\n    \n    def destroy_vm(self, vm_name):\n        \"\"\"Destroy a VM
+    and release its resources\"\"\"\n        logging.info(f\"Destroying VM: {vm_name}\")\n
+    \       \n        # Find VM instance directory\n        vm_id = vm_name.lower().replace('-',
+    '').replace('_', '')[:8]\n        instance_dir = os.path.join(DATA_DIR, \"instances\",
+    vm_id)\n        \n        # Kill Firecracker process\n        for proc in psutil.process_iter(['pid',
+    'name', 'cmdline']):\n            try:\n                if proc.info['name'] ==
+    'firecracker':\n                    cmdline = proc.info['cmdline']\n                    for
+    arg in cmdline:\n                        if f'instances/{vm_id}' in arg and 'firecracker.socket'
+    in arg:\n                            logging.info(f\"Killing Firecracker process
+    {proc.pid} for VM {vm_name}\")\n                            proc.kill()\n                            time.sleep(2)\n
+    \                           if proc.is_running():\n                                proc.kill()
+    \ # Force kill if still running\n                            break\n            except
+    (psutil.NoSuchProcess, psutil.AccessDenied):\n                continue\n        \n
+    \       # Clean up instance directory\n        if os.path.exists(instance_dir):\n
+    \           logging.info(f\"Cleaning up instance directory: {instance_dir}\")\n
+    \           subprocess.run([\"rm\", \"-rf\", instance_dir], check=False)\n        \n
+    \       # Release resources\n        self.release_resources(vm_name)\n        \n
+    \       logging.info(f\"VM {vm_name} destroyed successfully\")\n    \n    def
+    cleanup_dead_vms(self):\n        \"\"\"Periodically clean up resources for dead
+    VMs\"\"\"\n        while True:\n            try:\n                time.sleep(60)
+    \ # Check every minute\n                \n                # Get list of running
+    VM processes\n                running_vms = set()\n                for proc in
+    psutil.process_iter(['pid', 'name', 'cmdline']):\n                    try:\n                        if
+    proc.info['name'] == 'firecracker':\n                            # Extract VM
+    name from socket path\n                            cmdline = proc.info['cmdline']\n
+    \                           for arg in cmdline:\n                                if
+    'instances/' in arg and '/firecracker.socket' in arg:\n                                    vm_id
+    = arg.split('instances/')[1].split('/')[0]\n                                    running_vms.add(vm_id)\n
+    \                   except (psutil.NoSuchProcess, psutil.AccessDenied):\n                        continue\n
+    \               \n                # Check if tracked VMs are still running\n                tracked_vms
+    = list(self.resources[\"vms\"].keys())\n                for vm_name in tracked_vms:\n
+    \                   # Extract VM ID from name (assuming format like \"aki-vm-xxx\")\n
+    \                   vm_id = vm_name.lower().replace('-', '').replace('_', '')[:8]\n
+    \                   \n                    if vm_id not in running_vms:\n                        #
+    VM is not running, check if it's been dead for a while\n                        vm_data
+    = self.resources[\"vms\"][vm_name]\n                        last_seen = vm_data.get('last_seen',
+    vm_data['created_at'])\n                        \n                        if time.time()
+    - last_seen > 300:  # 5 minutes grace period\n                            logging.warning(f\"Cleaning
+    up dead VM: {vm_name}\")\n                            self.release_resources(vm_name)\n
+    \               \n            except Exception as e:\n                logging.error(f\"Error
+    in cleanup thread: {e}\")\n\nclass FirecrackerVMHandler(BaseHTTPRequestHandler):\n
+    \   def __init__(self, *args, resource_manager=None, **kwargs):\n        self.resource_manager
+    = resource_manager\n        super().__init__(*args, **kwargs)\n    \n    def log_message(self,
+    format, *args):\n        # Override to reduce noise in logs (optional)\n        pass\n
+    \   \n    def do_GET(self):\n        if self.path == '/health':\n            self.send_response(200)\n
+    \           self.send_header('Content-type', 'application/json')\n            self.end_headers()\n
+    \           \n            system_resources = self.resource_manager.get_system_resources()\n
+    \           health_data = {\n                \"status\": \"healthy\",\n                \"timestamp\":
+    time.time(),\n                \"system\": system_resources,\n                \"allocated_resources\":
+    {\n                    \"total_memory_mb\": self.resource_manager.resources[\"total_memory_mb\"],\n
+    \                   \"total_virtual_cpus\": self.resource_manager.resources[\"total_virtual_cpus\"],\n
+    \                   \"active_vms\": len(self.resource_manager.resources[\"vms\"])\n
+    \               }\n            }\n            self.wfile.write(json.dumps(health_data,
+    indent=2).encode())\n            \n        elif self.path == '/metrics':\n            #
+    Prometheus-style metrics endpoint for monitoring\n            self.send_response(200)\n
+    \           self.send_header('Content-type', 'text/plain')\n            self.end_headers()\n
+    \           \n            system_resources = self.resource_manager.get_system_resources()\n
+    \           allocated = self.resource_manager.resources\n            \n            metrics
+    = f\"\"\"# HELP firecracker_vms_total Total number of VMs\n# TYPE firecracker_vms_total
+    gauge\nfirecracker_vms_total {len(allocated[\"vms\"])}\n\n# HELP firecracker_memory_allocated_mb
+    Total allocated memory in MB\n# TYPE firecracker_memory_allocated_mb gauge\nfirecracker_memory_allocated_mb
+    {allocated[\"total_memory_mb\"]}\n\n# HELP firecracker_memory_available_mb Available
+    system memory in MB\n# TYPE firecracker_memory_available_mb gauge\nfirecracker_memory_available_mb
+    {system_resources[\"available_memory_mb\"]}\n\n# HELP firecracker_memory_max_usable_mb
+    Maximum usable memory for VMs in MB\n# TYPE firecracker_memory_max_usable_mb gauge\nfirecracker_memory_max_usable_mb
+    {system_resources[\"max_usable_memory_mb\"]}\n\n# HELP firecracker_vcpus_allocated
+    Total allocated virtual CPUs\n# TYPE firecracker_vcpus_allocated gauge\nfirecracker_vcpus_allocated
+    {allocated[\"total_virtual_cpus\"]}\n\n# HELP firecracker_vcpus_max_usable Maximum
+    usable virtual CPUs\n# TYPE firecracker_vcpus_max_usable gauge\nfirecracker_vcpus_max_usable
+    {system_resources[\"max_virtual_cpus\"]}\n\n# HELP firecracker_system_cpu_percent
+    System CPU usage percentage\n# TYPE firecracker_system_cpu_percent gauge\nfirecracker_system_cpu_percent
+    {system_resources[\"cpu_percent\"]}\n\n# HELP firecracker_system_memory_percent
+    System memory usage percentage\n# TYPE firecracker_system_memory_percent gauge\nfirecracker_system_memory_percent
+    {system_resources[\"memory_percent\"]}\n\n# HELP firecracker_system_load_1min
+    System load average (1 minute)\n# TYPE firecracker_system_load_1min gauge\nfirecracker_system_load_1min
+    {system_resources[\"load_1min\"]}\n\"\"\"\n            self.wfile.write(metrics.encode())\n
+    \           \n        elif self.path.startswith('/api/vms/'):\n            # Get
+    VM status\n            vm_name = self.path.split('/')[-1]\n            logging.info(f\"Getting
+    status for VM: {vm_name}\")\n            \n            vm_status = self.resource_manager.get_vm_status(vm_name)\n
+    \           \n            if vm_status:\n                self.send_response(200)\n
+    \               self.send_header('Content-type', 'application/json')\n                self.end_headers()\n
+    \               self.wfile.write(json.dumps(vm_status).encode())\n                logging.info(f\"Returned
+    status for VM {vm_name}: {vm_status['status']}\")\n            else:\n                self.send_response(404)\n
+    \               self.send_header('Content-type', 'application/json')\n                self.end_headers()\n
+    \               response = {\"error\": \"VM not found\", \"vm_name\": vm_name}\n
+    \               self.wfile.write(json.dumps(response).encode())\n                logging.warning(f\"VM
+    not found: {vm_name}\")\n        else:\n            self.send_response(404)\n
+    \           self.end_headers()\n    \n    def do_POST(self):\n        if self.path
+    == '/api/vms':\n            try:\n                content_length = int(self.headers['Content-Length'])\n
+    \               post_data = self.rfile.read(content_length)\n                request_data
+    = json.loads(post_data.decode('utf-8'))\n                \n                vm_name
+    = request_data['name']\n                memory_mb = request_data['memory']\n                cpus
+    = request_data['cpus']\n                github_url = request_data.get('github_url',
+    '')\n                github_token = request_data.get('github_token', '')\n                snapshot
+    = request_data.get('snapshot', '')\n                \n                logging.info(f\"Creating
+    VM: {vm_name} with {memory_mb}MB, {cpus} vCPUs\")\n                \n                #
+    Check if we can create the VM\n                can_create, message = self.resource_manager.can_create_vm(memory_mb,
+    cpus)\n                \n                if not can_create:\n                    self.send_response(429)
+    \ # Too Many Requests\n                    self.send_header('Content-type', 'application/json')\n
+    \                   self.end_headers()\n                    \n                    response
+    = {\n                        \"error\": \"Cannot create VM\",\n                        \"reason\":
+    message,\n                        \"vm_name\": vm_name\n                    }\n
+    \                   self.wfile.write(json.dumps(response).encode())\n                    logging.warning(f\"VM
+    creation denied for {vm_name}: {message}\")\n                    return\n                \n
+    \               # Reserve resources\n                self.resource_manager.reserve_resources(vm_name,
+    memory_mb, cpus)\n                \n                # Launch VM\n                cmd
+    = [\n                    SCRIPT_PATH, \"launch\",\n                    \"--name\",
+    vm_name,\n                    \"--memory\", str(memory_mb),\n                    \"--cpus\",
+    str(cpus),\n                    \"--use-host-bridge\",\n                    \"--arc-mode\",\n
+    \                   \"--skip-deps\"\n                ]\n                \n                if
+    snapshot:\n                    cmd.extend([\"--snapshot\", snapshot])\n                if
+    github_url:\n                    cmd.extend([\"--github-url\", github_url])\n
+    \               if github_token:\n                    cmd.extend([\"--github-token\",
+    github_token])\n                \n                # Set environment variable to
+    tell firecracker-complete.sh where to work\n                env = os.environ.copy()\n
+    \               env['FIRECRACKER_WORK_DIR'] = DATA_DIR\n                \n                #
+    Log the full command for debugging\n                logging.info(f\"Executing
+    command: {' '.join(cmd)}\")\n                logging.info(f\"Working directory:
+    {DATA_DIR}\")\n                logging.info(f\"Environment FIRECRACKER_WORK_DIR:
+    {DATA_DIR}\")\n                \n                # Execute in background with
+    correct environment and capture output\n                process = subprocess.Popen(cmd,
+    cwd=DATA_DIR, \n                                         stdout=subprocess.PIPE,
+    \n                                         stderr=subprocess.PIPE,\n                                         env=env,\n
+    \                                        text=True)\n                \n                #
+    Start a background thread to monitor the process\n                def monitor_process():\n
+    \                   try:\n                        stdout, stderr = process.communicate(timeout=300)
+    \ # 5 minute timeout\n                        logging.info(f\"VM creation process
+    completed for {vm_name}\")\n                        logging.info(f\"Return code:
+    {process.returncode}\")\n                        if stdout:\n                            logging.info(f\"STDOUT:
+    {stdout}\")\n                        if stderr:\n                            logging.error(f\"STDERR:
+    {stderr}\")\n                        \n                        if process.returncode
+    != 0:\n                            logging.error(f\"VM creation failed for {vm_name}
+    with return code {process.returncode}\")\n                            # Release
+    resources if VM creation failed\n                            self.resource_manager.release_resources(vm_name)\n
+    \                       else:\n                            logging.info(f\"VM
+    creation succeeded for {vm_name}\")\n                            # Update status
+    to running\n                            self.resource_manager.update_vm_status(vm_name,
+    \"running\")\n                            \n                    except subprocess.TimeoutExpired:\n
+    \                       logging.error(f\"VM creation timed out for {vm_name}\")\n
+    \                       process.kill()\n                        self.resource_manager.release_resources(vm_name)\n
+    \                   except Exception as e:\n                        logging.error(f\"Error
+    monitoring VM creation for {vm_name}: {e}\")\n                        self.resource_manager.release_resources(vm_name)\n
+    \               \n                # Start monitoring thread\n                monitor_thread
+    = threading.Thread(target=monitor_process, daemon=True)\n                monitor_thread.start()\n
+    \               \n                self.send_response(202)  # Accepted\n                self.send_header('Content-type',
+    'application/json')\n                self.end_headers()\n                \n                response
+    = {\n                    \"vm_name\": vm_name,\n                    \"status\":
+    \"creating\",\n                    \"message\": \"VM creation started\",\n                    \"assigned_node\":
+    os.uname().nodename\n                }\n                self.wfile.write(json.dumps(response).encode())\n
+    \               \n                logging.info(f\"Started VM creation: {vm_name}\")\n
+    \               \n            except Exception as e:\n                logging.error(f\"Error
+    creating VM: {e}\")\n                self.send_response(500)\n                self.send_header('Content-type',
+    'application/json')\n                self.end_headers()\n                \n                response
+    = {\"error\": f\"Internal server error: {e}\"}\n                self.wfile.write(json.dumps(response).encode())\n
+    \       else:\n            self.send_response(404)\n            self.end_headers()\n
+    \   \n    def do_DELETE(self):\n        if self.path.startswith('/api/vms/'):\n
+    \           # Delete VM\n            vm_name = self.path.split('/')[-1]\n            logging.info(f\"Deleting
+    VM: {vm_name}\")\n            \n            try:\n                # Check if VM
+    exists\n                vm_status = self.resource_manager.get_vm_status(vm_name)\n
+    \               \n                if vm_status:\n                    # Destroy
+    the VM\n                    self.resource_manager.destroy_vm(vm_name)\n                    \n
+    \                   self.send_response(200)\n                    self.send_header('Content-type',
+    'application/json')\n                    self.end_headers()\n                    \n
+    \                   response = {\n                        \"vm_name\": vm_name,\n
+    \                       \"status\": \"deleted\",\n                        \"message\":
+    \"VM deleted successfully\"\n                    }\n                    self.wfile.write(json.dumps(response).encode())\n
+    \                   logging.info(f\"VM {vm_name} deleted successfully\")\n                    \n
+    \               else:\n                    # VM not found\n                    self.send_response(404)\n
+    \                   self.send_header('Content-type', 'application/json')\n                    self.end_headers()\n
+    \                   \n                    response = {\n                        \"error\":
+    \"VM not found\",\n                        \"vm_name\": vm_name\n                    }\n
+    \                   self.wfile.write(json.dumps(response).encode())\n                    logging.warning(f\"Attempted
+    to delete non-existent VM: {vm_name}\")\n                    \n            except
+    Exception as e:\n                logging.error(f\"Error deleting VM {vm_name}:
+    {e}\")\n                self.send_response(500)\n                self.send_header('Content-type',
+    'application/json')\n                self.end_headers()\n                \n                response
+    = {\n                    \"error\": f\"Failed to delete VM: {e}\",\n                    \"vm_name\":
+    vm_name\n                }\n                self.wfile.write(json.dumps(response).encode())\n
+    \       else:\n            self.send_response(404)\n            self.end_headers()\n\ndef
+    create_handler_class(resource_manager):\n    def handler(*args, **kwargs):\n        FirecrackerVMHandler(*args,
+    resource_manager=resource_manager, **kwargs)\n    return handler\n\ndef signal_handler(signum,
+    frame):\n    print(f\"\\nReceived signal {signum}, shutting down...\")\n    sys.exit(0)\n\ndef
+    main():\n    # Initialize system limits\n    init_system_limits()\n    \n    #
+    Set up signal handlers\n    signal.signal(signal.SIGINT, signal_handler)\n    signal.signal(signal.SIGTERM,
+    signal_handler)\n    \n    # Create resource manager\n    resource_manager = DynamicResourceManager()\n
+    \   \n    # Create HTTP server\n    handler_class = create_handler_class(resource_manager)\n
+    \   server = HTTPServer(('0.0.0.0', LISTEN_PORT), handler_class)\n    \n    print(f\"Firecracker
+    VM Agent starting on port {LISTEN_PORT}\")\n    print(f\"Resource limits: {MAX_USABLE_MEMORY_MB}MB
+    memory, {MAX_VIRTUAL_CPUS} vCPUs\")\n    print(f\"Supported endpoints:\")\n    print(f\"
+    \ GET  /health - Health check\")\n    print(f\"  GET  /metrics - Prometheus metrics\")\n
+    \   print(f\"  GET  /api/vms/{{vm_name}} - Get VM status\")\n    print(f\"  POST
+    /api/vms - Create VM\")\n    print(f\"  DELETE /api/vms/{{vm_name}} - Delete VM\")\n
+    \   \n    try:\n        server.serve_forever()\n    except KeyboardInterrupt:\n
+    \       print(\"\\nShutting down...\")\n        server.shutdown()\n\nif __name__
+    == \"__main__\":\n    main()\nEOF\n\nchmod +x \"$INSTALL_DIR/vm-agent.py\"\n\n#
+    Create systemd service with dynamic environment\nprint_info \"Creating systemd
+    service...\"\ncat > /etc/systemd/system/firecracker-agent.service << EOF\n[Unit]\nDescription=Firecracker
+    VM Agent ($HOSTNAME)\nAfter=network.target\nWants=network.target\n\n[Service]\nType=simple\nUser=root\nWorkingDirectory=$DATA_DIR\nExecStart=/usr/bin/python3
+    $INSTALL_DIR/vm-agent.py\nRestart=always\nRestartSec=10\n\n# Dynamic resource
+    configuration\nEnvironment=HOSTNAME=$HOSTNAME\nEnvironment=TOTAL_MEMORY_MB=$TOTAL_MEMORY_MB\nEnvironment=TOTAL_CPUS=$TOTAL_CPUS\n\n#
+    Security settings\nNoNewPrivileges=false\nPrivateTmp=false\nProtectSystem=false\nProtectHome=false\n\n[Install]\nWantedBy=multi-user.target\nEOF\n\n#
+    Set permissions\nprint_info \"Setting permissions...\"\nchown -R root:root \"$INSTALL_DIR\"\n\n#
+    Enable and start service\nprint_info \"Enabling and starting service...\"\nsystemctl
+    daemon-reload\nsystemctl enable firecracker-agent\nsystemctl start firecracker-agent\n\n#
+    Wait for service to start\nsleep 3\n\n# Test the service\nprint_info \"Testing
+    the service...\"\nif systemctl is-active --quiet firecracker-agent; then\n    print_info
+    \"✅ Firecracker agent is running\"\n    \n    # Test HTTP endpoint\n    if curl
+    -s http://localhost:$VM_AGENT_PORT/health >/dev/null; then\n        print_info
+    \"✅ HTTP endpoint is responding\"\n        \n        # Show resource information\n
+    \       echo \"\U0001F4CA Resource Information:\"\n        curl -s http://localhost:$VM_AGENT_PORT/health
+    | jq '.system' 2>/dev/null || echo \"   (jq not available for pretty printing)\"\n
+    \   else\n        print_warning \"⚠️  HTTP endpoint not responding yet (may need
+    a few seconds)\"\n    fi\nelse\n    print_error \"❌ Firecracker agent failed to
+    start\"\n    systemctl status firecracker-agent --no-pager\n    exit 1\nfi\n\nprint_info
+    \"✅ Installation complete!\"\nprint_info \"\"\nprint_info \"Firecracker VM Agent
+    Details:\"\nprint_info \"  Node: $HOSTNAME\"\nprint_info \"  Location: $INSTALL_DIR\"\nprint_info
+    \"  Data: $DATA_DIR\"\nprint_info \"  Service: firecracker-agent\"\nprint_info
+    \"  Port: $VM_AGENT_PORT\"\nprint_info \"  Logs: journalctl -u firecracker-agent
+    -f\"\nprint_info \"\"\nprint_info \"Dynamic Resource Limits:\"\nprint_info \"
+    \ Max VM Memory: ${MAX_USABLE_MEMORY_MB}MB\"\nprint_info \"  Max Virtual CPUs:
+    $MAX_VIRTUAL_CPUS (${CPU_OVERSUBSCRIPTION_RATIO}x oversubscription)\"\nprint_info
+    \"\"\nprint_info \"Test with: curl http://localhost:$VM_AGENT_PORT/health\" "
+kind: ConfigMap
+metadata:
+  creationTimestamp: null
+  name: firecracker-host-install-v2
+  namespace: arc-systems
